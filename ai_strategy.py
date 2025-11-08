@@ -161,6 +161,7 @@ class DynamicGridEnv(gym.Env):
         self.initial_cash = float(initial_cash)
         self.fee = float(fee)
         self.monthly_invest = float(monthly_invest)
+        self.min_commission: float = 5.0
 
         self.action_space = spaces.Box(
             low=np.array([0.005, 0.01, 0.10], dtype=np.float32),
@@ -300,12 +301,12 @@ class DynamicGridEnv(gym.Env):
 
         if target_value > current_value + 1e-8:
             amount_needed = target_value - current_value
-            max_affordable = self.cash / (1 + self.fee)
+            max_affordable = self._max_affordable_buy_amount()
             amount_to_buy = min(max(amount_needed, 0.0), max_affordable)
             if amount_to_buy > 0:
                 shares_to_buy = amount_to_buy / current_price
-                commission_paid = amount_to_buy * self.fee
-                total_cost = amount_to_buy * (1 + self.fee)
+                commission_paid = self._calculate_commission(amount_to_buy)
+                total_cost = amount_to_buy + commission_paid
                 self.holding_shares += shares_to_buy
                 self.cash -= total_cost
                 self.last_trade_price = current_price
@@ -338,11 +339,11 @@ class DynamicGridEnv(gym.Env):
             shares_to_sell = min(self.holding_shares, amount_to_release / current_price)
             if shares_to_sell > 0:
                 proceeds = shares_to_sell * current_price
-                commission_paid = proceeds * self.fee
+                commission_paid = self._calculate_commission(proceeds)
                 holding_before = max(self.holding_shares, 1e-8)
                 ratio = float(shares_to_sell) / holding_before
                 cost_released = self._position_cost * ratio
-                net_proceeds = proceeds * (1 - self.fee)
+                net_proceeds = proceeds - commission_paid
                 self.holding_shares -= shares_to_sell
                 self.cash += net_proceeds
                 self.total_commission += commission_paid
@@ -388,6 +389,26 @@ class DynamicGridEnv(gym.Env):
         info["trades"] = trades_this_step
         info["last_action"] = action_array.tolist()
         return self._get_obs(), float(reward), terminated, truncated, info
+
+    def _max_affordable_buy_amount(self) -> float:
+        cash_available = max(self.cash, 0.0)
+        if cash_available <= 0 or self.fee < 0:
+            return 0.0
+        min_fee = max(self.min_commission, 0.0)
+        if self.fee == 0:
+            return max(cash_available - min_fee, 0.0) if min_fee > 0 else cash_available
+        if cash_available <= min_fee:
+            return 0.0
+        threshold = min_fee / self.fee if self.fee > 0 else float("inf")
+        candidate = cash_available - min_fee
+        if candidate < threshold:
+            return max(candidate, 0.0)
+        return cash_available / (1.0 + self.fee)
+
+    def _calculate_commission(self, trade_amount: float) -> float:
+        if trade_amount <= 0 or self.fee <= 0:
+            return 0.0
+        return max(trade_amount * self.fee, self.min_commission)
 
     def get_nav_series(self) -> pd.Series:
         index = self.nav_index

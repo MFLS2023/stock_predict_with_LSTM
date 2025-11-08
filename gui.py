@@ -43,6 +43,7 @@ if TYPE_CHECKING:  # pragma: no cover
 from PyQt5.QtCore import QObject, QThread, pyqtSignal, QTranslator, QLocale, QLibraryInfo, Qt, QTimer, QDate
 from PyQt5.QtWidgets import (
     QAbstractSpinBox,
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -50,17 +51,20 @@ from PyQt5.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
-    QPlainTextEdit,
     QSpinBox,
     QTabWidget,  # Added QTabWidget
-    QGroupBox,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -815,10 +819,8 @@ class MainWindow(QMainWindow):
         self._clear_kline_canvas()
         canvas = FigureCanvas(fig)
         toolbar = NavigationToolbar(canvas, self.kline_widget)
-        self.kline_layout.addWidget(canvas)
-        self.kline_layout.addWidget(toolbar)
-        self.kline_layout.addWidget(self.chart_info_label)
-        self.chart_info_label.setText("提示：鼠标移动查看报价，Ctrl+滚轮缩放，拖动平移。")
+        self.chart_container_layout.addWidget(canvas)
+        self.chart_container_layout.addWidget(toolbar)
         self._kline_canvas = canvas
         self._kline_toolbar = toolbar
         self._last_backtest_result = None
@@ -860,15 +862,39 @@ class MainWindow(QMainWindow):
         self.kline_widget = QWidget()
         self.kline_layout = QVBoxLayout(self.kline_widget)
         self.kline_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.chart_container = QWidget()
+        self.chart_container_layout = QVBoxLayout(self.chart_container)
+        self.chart_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.chart_container_layout.setSpacing(6)
+
         self.chart_placeholder = QLabel(
             "图表分析区 - 请选择数据文件以自动加载图表\nChart Analysis Area - Select a data file to automatically load the chart"
         )
         self.chart_placeholder.setAlignment(Qt.AlignCenter)
         self.chart_placeholder.setStyleSheet("color: #888888;")
-        self.kline_layout.addWidget(self.chart_placeholder)
-        self.chart_info_label = QLabel(" ")
-        self.chart_info_label.setStyleSheet("color: #555555;")
-        self.kline_layout.addWidget(self.chart_info_label)
+        self.chart_container_layout.addWidget(self.chart_placeholder)
+
+        self.kline_layout.addWidget(self.chart_container, stretch=1)
+
+        self.metrics_table = QTableWidget(0, 0)
+        self.metrics_table.setAlternatingRowColors(True)
+        self.metrics_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.metrics_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.metrics_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.metrics_table.setFocusPolicy(Qt.NoFocus)
+        self.metrics_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.metrics_table.verticalHeader().setVisible(False)
+        self.metrics_table.setVisible(False)
+        self.metrics_table.setObjectName("strategyMetricsTable")
+
+        self.crosshair_info_label = QLabel(
+            "提示：鼠标移动查看报价，Ctrl+滚轮缩放，拖动平移。"
+        )
+        self.crosshair_info_label.setStyleSheet("color: #555555;")
+
+        self.kline_layout.addWidget(self.metrics_table)
+        self.kline_layout.addWidget(self.crosshair_info_label)
         layout.addWidget(self.kline_widget, stretch=1)
 
     def _create_training_tab(self) -> None:
@@ -1714,13 +1740,13 @@ class MainWindow(QMainWindow):
         self._clear_kline_canvas()
 
         fig, axes = plt.subplots(
-            nrows=3,
+            nrows=2,
             ncols=1,
             sharex=True,
-            figsize=(12, 10),
-            gridspec_kw={'height_ratios': [3, 1, 2]},
+            figsize=(12, 8),
+            gridspec_kw={'height_ratios': [3, 1.6]},
         )
-        fig.tight_layout(pad=4.0)
+        fig.tight_layout(pad=3.0)
 
         color_cycle = plt.rcParams['axes.prop_cycle'].by_key().get('color', ['#1f77b4', '#ff7f0e', '#2ca02c'])
 
@@ -1747,45 +1773,15 @@ class MainWindow(QMainWindow):
 
         axes[1].set_title("最大回撤对比", fontproperties=getattr(self, '_chinese_font_prop', None))
         axes[1].set_ylabel("回撤", fontproperties=getattr(self, '_chinese_font_prop', None))
+        axes[1].set_xlabel("日期", fontproperties=getattr(self, '_chinese_font_prop', None))
         axes[1].grid(True, alpha=0.3)
         axes[1].yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
-
-        # --- 子图3: PPO 行为 ---
-        axes[2].set_title("PPO 策略行为")
-        axes[2].set_xlabel("日期")
-        axes[2].set_ylabel("仓位比例", color='tab:blue')
-        axes[2].set_ylim(0, 1.05)
-        axes[2].grid(True, alpha=0.3)
-
-        ppo_payload = strategies.get('PPO 动态策略', {})
-        actions_df = ppo_payload.get('actions_df')
-        twin_ax = None
-        if isinstance(actions_df, pd.DataFrame) and not actions_df.empty:
-            if '仓位比例' in actions_df.columns:
-                axes[2].plot(actions_df.index, actions_df['仓位比例'], label='PPO 仓位比例', color='tab:blue')
-            else:
-                axes[2].plot(actions_df.index, actions_df.iloc[:, -1], label='PPO 行为', color='tab:blue')
-
-            if '网格间距' in actions_df.columns:
-                twin_ax = axes[2].twinx()
-                twin_ax.plot(actions_df.index, actions_df['网格间距'], label='网格间距', color='tab:orange', alpha=0.6)
-                twin_ax.set_ylabel('网格间距', color='tab:orange')
-                twin_ax.tick_params(axis='y', labelcolor='tab:orange')
-
-            lines, labels = axes[2].get_legend_handles_labels()
-            if twin_ax is not None:
-                lines2, labels2 = twin_ax.get_legend_handles_labels()
-                axes[2].legend(lines + lines2, labels + labels2, loc='upper right')
-            else:
-                axes[2].legend(loc='upper right')
-        else:
-            axes[2].text(0.5, 0.5, "暂无 PPO 行为数据", transform=axes[2].transAxes, ha='center', va='center', color='gray')
+        axes[1].legend(loc='lower left')
 
         canvas = FigureCanvas(fig)
         toolbar = NavigationToolbar(canvas, self.kline_widget)
-        self.kline_layout.addWidget(canvas)
-        self.kline_layout.addWidget(toolbar)
-        self.kline_layout.addWidget(self.chart_info_label)
+        self.chart_container_layout.addWidget(canvas)
+        self.chart_container_layout.addWidget(toolbar)
 
         self._kline_canvas = canvas
         self._kline_toolbar = toolbar
@@ -1795,29 +1791,81 @@ class MainWindow(QMainWindow):
         self.export_backtest_button.setEnabled(True)
         self.tabs.setCurrentIndex(0)
 
-        def format_pct(val: Any) -> str:
-            return f"{val:.2%}" if isinstance(val, (int, float)) and pd.notna(val) else "--"
+        self._populate_metrics_table(strategies)
 
-        def format_number(val: Any) -> str:
-            return f"{val:,.2f}" if isinstance(val, (int, float)) and pd.notna(val) else "--"
+    def _populate_metrics_table(self, strategies: Dict[str, Any]) -> None:
+        if not isinstance(strategies, dict) or not strategies:
+            self.metrics_table.setVisible(False)
+            self.metrics_table.setRowCount(0)
+            return
 
-        info_lines: list[str] = []
-        for name, payload in strategies.items():
-            metrics = payload.get('metrics', {}) or {}
-            info_lines.append(f"--- {name} ---")
-            info_lines.append(f"  总回报: {format_pct(metrics.get('总回报率'))}")
-            info_lines.append(f"  最大回撤: {format_pct(metrics.get('最大回撤'))}")
-            if '夏普比率' in metrics:
-                info_lines.append(f"  夏普比率: {format_number(metrics.get('夏普比率'))}")
-            if '胜率' in metrics:
-                info_lines.append(f"  胜率: {format_pct(metrics.get('胜率'))}")
-            if '总交易次数' in metrics:
-                info_lines.append(f"  交易次数: {metrics.get('总交易次数', '--')}")
-            if '最终净值' in metrics:
-                info_lines.append(f"  最终净值: {format_number(metrics.get('最终净值'))}")
-            info_lines.append("")
+        headers = [
+            "策略名称",
+            "综合评分",
+            "总回报率",
+            "年化回报率",
+            "最大回撤",
+            "夏普比率",
+            "胜率",
+            "总交易次数",
+            "最终净值",
+        ]
 
-        self.chart_info_label.setText("\n".join(info_lines).strip())
+        def format_pct(value: Any) -> str:
+            if isinstance(value, (int, float)) and pd.notna(value) and np.isfinite(float(value)):
+                return f"{float(value):.2%}"
+            return "--"
+
+        def format_number(value: Any, decimals: int = 2) -> str:
+            if isinstance(value, (int, float)) and pd.notna(value) and np.isfinite(float(value)):
+                return f"{float(value):,.{decimals}f}"
+            return "--"
+
+        self.metrics_table.setVisible(True)
+        self.metrics_table.setSortingEnabled(False)
+        self.metrics_table.clear()
+        self.metrics_table.setColumnCount(len(headers))
+        self.metrics_table.setHorizontalHeaderLabels(headers)
+        self.metrics_table.setRowCount(len(strategies))
+
+        for row_idx, (name, payload) in enumerate(strategies.items()):
+            metrics = payload.get("metrics", {}) if isinstance(payload, dict) else {}
+            values = [
+                name,
+                format_number(metrics.get("综合评分"), decimals=3),
+                format_pct(metrics.get("总回报率")),
+                format_pct(metrics.get("年化回报率")),
+                format_pct(metrics.get("最大回撤")),
+                format_number(metrics.get("夏普比率"), decimals=3),
+                format_pct(metrics.get("胜率")),
+                str(int(metrics.get("总交易次数", 0))) if isinstance(metrics.get("总交易次数"), (int, float)) else "--",
+                format_number(metrics.get("最终净值")),
+            ]
+
+            raw_values = [
+                name,
+                metrics.get("综合评分"),
+                metrics.get("总回报率"),
+                metrics.get("年化回报率"),
+                metrics.get("最大回撤"),
+                metrics.get("夏普比率"),
+                metrics.get("胜率"),
+                metrics.get("总交易次数"),
+                metrics.get("最终净值"),
+            ]
+
+            for col_idx, (display, raw) in enumerate(zip(values, raw_values)):
+                item = QTableWidgetItem(display)
+                if isinstance(raw, (int, float)) and pd.notna(raw) and np.isfinite(float(raw)):
+                    item.setData(Qt.UserRole, float(raw))
+                else:
+                    item.setData(Qt.UserRole, None)
+                item.setTextAlignment(Qt.AlignCenter)
+                self.metrics_table.setItem(row_idx, col_idx, item)
+
+        self.metrics_table.setSortingEnabled(True)
+        self.metrics_table.sortItems(1, Qt.DescendingOrder)
+        self.metrics_table.horizontalHeader().setStretchLastSection(True)
 
     def export_ppo_trades(self) -> None:
         if not self.ai_last_result:
@@ -1855,21 +1903,30 @@ class MainWindow(QMainWindow):
         if self._kline_canvas is not None:
             for cid in self._kline_mpl_cids:
                 self._kline_canvas.mpl_disconnect(cid)
-        self._kline_mpl_cids = []
         self._kline_canvas = None
         self._kline_toolbar = None
+        self._kline_mpl_cids = []
 
-        # 清空布局内的组件
-        while self.kline_layout.count():
-            item = self.kline_layout.takeAt(0)
+        layout = getattr(self, "chart_container_layout", None)
+        if layout is None:
+            return
+
+        while layout.count():
+            item = layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.setParent(None)
 
-        if keep_placeholder:
-            self.kline_layout.addWidget(self.chart_placeholder)
-            self.chart_info_label.setText(" ")
-            self.kline_layout.addWidget(self.chart_info_label)
+        if keep_placeholder and getattr(self, "chart_placeholder", None) is not None:
+            layout.addWidget(self.chart_placeholder)
+
+        if hasattr(self, "metrics_table"):
+            self.metrics_table.setVisible(False)
+            self.metrics_table.setRowCount(0)
+        if hasattr(self, "crosshair_info_label"):
+            self.crosshair_info_label.setText(
+                "提示：鼠标移动查看报价，Ctrl+滚轮缩放，拖动平移。"
+            )
 
 
     def _prepare_spinbox(self, spinbox: QAbstractSpinBox, placeholder: Optional[str] = None) -> None:
@@ -2084,7 +2141,7 @@ class MainWindow(QMainWindow):
 
             self._last_backtest_result = result
             self.export_backtest_button.setEnabled(True)
-            self._display_backtest_on_kline(result)
+            self._display_backtest_on_kline(result, selected_strategy)
             self.append_log(f"回测完成: {selected_strategy}")
             self.status_label.setText("回测完成")
 
@@ -2095,7 +2152,7 @@ class MainWindow(QMainWindow):
         finally:
             self._set_controls_enabled(True)
 
-    def _display_backtest_on_kline(self, result: Dict[str, Any]) -> None:
+    def _display_backtest_on_kline(self, result: Dict[str, Any], strategy_name: Optional[str] = None) -> None:
         """在现有的K线图上叠加回测结果"""
         if self._kline_canvas is None:
             self.show_kline() # 如果没有图，先画一个
@@ -2146,14 +2203,14 @@ class MainWindow(QMainWindow):
         # 更新信息标签
         metrics = result.get('metrics', {})
         info_text = (
-            f"最终净值: {metrics.get('Final Equity', 0):,.2f} | "
-            f"总收益: {metrics.get('Total Return', 0):.2%} | "
-            f"年化收益: {metrics.get('Annualized Return', 0):.2%} | "
-            f"最大回撤: {metrics.get('Max Drawdown', 0):.2%} | "
-            f"夏普比率: {metrics.get('Sharpe Ratio', 0):.2f} | "
-            f"交易次数: {metrics.get('Total Trades', 0)}"
+            f"最终净值: {metrics.get('最终净值', 0):,.2f} | "
+            f"总收益: {metrics.get('总回报率', 0):.2%} | "
+            f"年化收益: {metrics.get('年化回报率', 0):.2%} | "
+            f"最大回撤: {metrics.get('最大回撤', 0):.2%} | "
+            f"夏普比率: {metrics.get('夏普比率', 0):.2f} | "
+            f"交易次数: {metrics.get('总交易次数', 0)}"
         )
-        self.chart_info_label.setText(info_text)
+        self._populate_metrics_table({strategy_name or "回测策略": {"metrics": metrics}})
         self.append_log(f"回测指标: {info_text}")
 
     def export_backtest_report(self) -> None:
@@ -2345,7 +2402,7 @@ class MainWindow(QMainWindow):
         if 'K' in series and 'D' in series and 'J' in series:
             parts.append(f"KDJ: {series['K']:.1f}, {series['D']:.1f}, {series['J']:.1f}")
 
-        self.chart_info_label.setText(" | ".join(parts))
+        self.crosshair_info_label.setText(" | ".join(parts))
 
     def _setup_ctrl_zoom(self, canvas: FigureCanvas, axes: list, dates: pd.DatetimeIndex) -> None:
         """通过 Ctrl+滚轮 实现K线图的缩放"""

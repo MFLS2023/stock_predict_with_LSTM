@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -169,6 +170,50 @@ def _calculate_metrics(equity_curve: pd.Series, trade_log: List[Dict[str, Any]])
         "总交易次数": len(trade_log),
         "最终净值": end_value,
     }
+
+
+def _compute_composite_scores(strategies: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+    metric_config = {
+        "总回报率": {"weight": 0.5, "higher": True},
+        "夏普比率": {"weight": 0.3, "higher": True},
+        "最大回撤": {"weight": 0.2, "higher": False},
+    }
+
+    collected: Dict[str, List[float]] = {key: [] for key in metric_config}
+    for metrics in (data.get("metrics", {}) for data in strategies.values()):
+        for name in metric_config:
+            value = metrics.get(name)
+            if value is not None and isinstance(value, (int, float)) and math.isfinite(float(value)):
+                collected[name].append(float(value))
+
+    scores: Dict[str, float] = {}
+    for strategy_name, data in strategies.items():
+        metrics = data.get("metrics", {})
+        score = 0.0
+        total_weight = 0.0
+        for metric_name, cfg in metric_config.items():
+            weight = float(cfg["weight"])
+            total_weight += weight
+            value = metrics.get(metric_name)
+            if value is None or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                normalized = 0.5
+            else:
+                values = collected.get(metric_name, [])
+                if not values:
+                    normalized = 0.5
+                else:
+                    max_v = max(values)
+                    min_v = min(values)
+                    if math.isclose(max_v, min_v):
+                        normalized = 0.5
+                    else:
+                        normalized = (float(value) - min_v) / (max_v - min_v)
+                if not cfg["higher"]:
+                    normalized = 1.0 - normalized
+                normalized = max(0.0, min(1.0, normalized))
+            score += normalized * weight
+        scores[strategy_name] = score / total_weight if total_weight > 0 else 0.0
+    return scores
 
 
 def run_ppo_backtest(
@@ -403,6 +448,10 @@ def run_ai_comparison_backtest(
                 "actions_df": pd.DataFrame(),
                 "raw": {},
             }
+
+    composite_scores = _compute_composite_scores(strategies)
+    for name, composite_score in composite_scores.items():
+        strategies[name].setdefault("metrics", {})["综合评分"] = float(composite_score)
 
     summary = {name: data.get("metrics", {}) for name, data in strategies.items()}
 
