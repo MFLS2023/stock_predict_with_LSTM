@@ -8,13 +8,35 @@
 tensorflow 模型
 """
 
-import tensorflow as tf
+from __future__ import annotations
+
+from typing import Any, Optional, Tuple
+
 import numpy as np
-tf.logging.set_verbosity(tf.logging.ERROR)
+
+_TF_IMPORT_ERROR: Optional[Exception] = None
+try:  # pragma: no cover - optional dependency
+    import tensorflow as tf  # type: ignore
+except Exception as exc:  # noqa: BLE001
+    tf = None  # type: ignore[assignment]
+    _TF_IMPORT_ERROR = exc
+    tfv1 = None  # type: ignore[assignment]
+else:  # pragma: no branch
+    tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
+    tf.compat.v1.disable_v2_behavior()
+    tfv1 = tf.compat.v1
+
+
+def _require_tf() -> Tuple[Any, Any]:
+    if tf is None or tfv1 is None:
+        message = "未检测到 TensorFlow，请先安装相关依赖：pip install tensorflow"
+        raise ImportError(message) from _TF_IMPORT_ERROR
+    return tf, tfv1
 
 class Model:
     def __init__(self, config):
         self.config = config
+        self._tf, self._tfv1 = _require_tf()
 
         self.placeholders()
         self.net()
@@ -22,53 +44,73 @@ class Model:
 
 
     def placeholders(self):
-        self.X = tf.placeholder(tf.float32, [None,self.config.time_step,self.config.input_size])
-        self.Y = tf.placeholder(tf.float32, [None,self.config.time_step,self.config.output_size])
+        self.X = self._tfv1.placeholder(self._tf.float32, [None,self.config.time_step,self.config.input_size])
+        self.Y = self._tfv1.placeholder(self._tf.float32, [None,self.config.time_step,self.config.output_size])
 
 
     def net(self):
 
         def dropout_cell():
-            basicLstm = tf.nn.rnn_cell.LSTMCell(self.config.hidden_size)
-            dropoutLstm = tf.nn.rnn_cell.DropoutWrapper(basicLstm, output_keep_prob=1-self.config.dropout_rate)
+            basicLstm = self._tfv1.nn.rnn_cell.LSTMCell(self.config.hidden_size)
+            dropoutLstm = self._tfv1.nn.rnn_cell.DropoutWrapper(basicLstm, output_keep_prob=1-self.config.dropout_rate)
             return dropoutLstm
 
-        cell = tf.nn.rnn_cell.MultiRNNCell([dropout_cell() for _ in range(self.config.lstm_layers)])
+        cell = self._tfv1.nn.rnn_cell.MultiRNNCell([dropout_cell() for _ in range(self.config.lstm_layers)])
 
-        output_rnn, _ = tf.nn.dynamic_rnn(cell=cell, inputs=self.X, dtype=tf.float32)
+        output_rnn, _ = self._tfv1.nn.dynamic_rnn(cell=cell, inputs=self.X, dtype=self._tf.float32)
 
         # shape of output_rnn is: [batch_size, time_step, hidden_size]
-        self.pred = tf.layers.dense(inputs=output_rnn, units=self.config.output_size)
+        self.pred = self._tfv1.layers.dense(inputs=output_rnn, units=self.config.output_size)
 
 
     def operate(self):
-        self.loss = tf.reduce_mean(tf.square(tf.reshape(self.pred, [-1]) - tf.reshape(self.Y, [-1])))
-        self.optim = tf.train.AdamOptimizer(self.config.learning_rate).minimize(self.loss)
-        self.saver = tf.train.Saver(tf.global_variables())
+        self.loss = self._tfv1.reduce_mean(self._tf.square(self._tf.reshape(self.pred, [-1]) - self._tf.reshape(self.Y, [-1])))
+        self.optim = self._tfv1.train.AdamOptimizer(self.config.learning_rate).minimize(self.loss)
+        self.saver = self._tfv1.train.Saver(self._tfv1.global_variables())
 
 
 def train(config, logger, train_and_valid_data):
+    _, tfv1 = _require_tf()
     if config.do_train_visualized:  # loss可视化
-        from tensorboardX import SummaryWriter
-        train_writer = SummaryWriter(config.log_save_path + "Train")
-        eval_writer = SummaryWriter(config.log_save_path + "Eval")
+        try:
+            from tensorboardX import SummaryWriter
+        except ImportError:
+            logger.warning("未安装 tensorboardX，已跳过可视化记录。")
+            config.do_train_visualized = False
+        else:
+            train_writer = SummaryWriter(config.log_save_path + "Train")
+            eval_writer = SummaryWriter(config.log_save_path + "Eval")
 
-    with tf.variable_scope("stock_predict"):
+    with tfv1.variable_scope("stock_predict"):
         model = Model(config)
 
     train_X, train_Y, valid_X, valid_Y = train_and_valid_data
     train_len = len(train_X)
     valid_len = len(valid_X)
 
-    if config.use_cuda:     # 开启GPU训练会有很多警告，但不影响训练
-        sess_config = tf.ConfigProto(log_device_placement=True, allow_soft_placement=True) #在CUDA可用时会自动选择GPU，否则CPU
-        sess_config.gpu_options.per_process_gpu_memory_fraction = 0.7  # 显存占用率
-        sess_config.gpu_options.allow_growth=True   #初始化时不全部占满GPU显存, 按需分配
-    else:
-        sess_config = None
+    # 设备选择逻辑
+    device_pref = getattr(config, 'device_preference', 'auto').lower()
+    
+    if device_pref == 'cpu':
+        logger.info("使用 CPU 进行训练")
+        sess_config = tfv1.ConfigProto(device_count={'GPU': 0})
+    elif device_pref == 'gpu':
+        logger.info("强制使用 GPU 进行训练")
+        sess_config = tfv1.ConfigProto(log_device_placement=True, allow_soft_placement=True)
+        sess_config.gpu_options.per_process_gpu_memory_fraction = 0.7
+        sess_config.gpu_options.allow_growth = True
+    else:  # auto
+        if config.use_cuda:
+            logger.info("自动模式：尝试使用GPU训练")
+            sess_config = tfv1.ConfigProto(log_device_placement=True, allow_soft_placement=True)
+            sess_config.gpu_options.per_process_gpu_memory_fraction = 0.7
+            sess_config.gpu_options.allow_growth = True
+        else:
+            logger.info("自动模式：使用CPU训练")
+            sess_config = None
 
-    with tf.Session(config=sess_config) as sess:
-        sess.run(tf.global_variables_initializer())
+    with tfv1.Session(config=sess_config) as sess:
+        sess.run(tfv1.global_variables_initializer())
 
         valid_loss_min = float("inf")
         bad_epoch = 0
@@ -114,15 +156,16 @@ def train(config, logger, train_and_valid_data):
 
 
 def predict(config, test_X):
+    _, tfv1 = _require_tf()
     config.dropout_rate = 0     # 预测模式要调为1
 
-    tf.reset_default_graph()    # # 清除默认图的堆栈，并设置全局图为默认图
-    with tf.variable_scope("stock_predict", reuse=tf.AUTO_REUSE):
+    tfv1.reset_default_graph()    # # 清除默认图的堆栈，并设置全局图为默认图
+    with tfv1.variable_scope("stock_predict", reuse=tfv1.AUTO_REUSE):
         model = Model(config)
 
     test_len = len(test_X)
-    with tf.Session() as sess:
-        module_file = tf.train.latest_checkpoint(config.model_save_path)
+    with tfv1.Session() as sess:
+        module_file = tfv1.train.latest_checkpoint(config.model_save_path)
         model.saver.restore(sess, module_file)
 
         result = np.zeros((test_len*config.time_step, config.output_size))

@@ -8,10 +8,30 @@
 pytorch 模型
 """
 
+from pathlib import Path
+
 import torch
 from torch.nn import Module, LSTM, Linear
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
+
+
+def _resolve_checkpoint_path(config) -> Path:
+    """Return the full path to the configured checkpoint file."""
+    return Path(config.model_save_path).joinpath(config.model_name)
+
+
+def _load_checkpoint(path: Path, *, map_location=None):
+    """Load a torch checkpoint using weights-only mode when available."""
+    load_kwargs = {"map_location": map_location}
+    try:
+        return torch.load(path, weights_only=True, **load_kwargs)
+    except TypeError:
+        return torch.load(path, **load_kwargs)
+    except FileNotFoundError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Failed to load checkpoint '{path}': {exc}") from exc
 
 class Net(Module):
     '''
@@ -30,7 +50,7 @@ class Net(Module):
         return linear_out, hidden
 
 
-def train(config, logger, train_and_valid_data):
+def train(config, logger, train_and_valid_data, device):
     if config.do_train_visualized:
         import visdom
         vis = visdom.Visdom(env='model_pytorch')
@@ -42,10 +62,19 @@ def train(config, logger, train_and_valid_data):
     valid_X, valid_Y = torch.from_numpy(valid_X).float(), torch.from_numpy(valid_Y).float()
     valid_loader = DataLoader(TensorDataset(valid_X, valid_Y), batch_size=config.batch_size)
 
-    device = torch.device("cuda:0" if config.use_cuda and torch.cuda.is_available() else "cpu") # CPU训练还是GPU
+    device = torch.device(device)
     model = Net(config).to(device)      # 如果是GPU训练， .to(device) 会把模型/数据复制到GPU显存中
+    model_path = _resolve_checkpoint_path(config)
     if config.add_train:                # 如果是增量训练，会先加载原模型参数
-        model.load_state_dict(torch.load(config.model_save_path + config.model_name))
+        if model_path.exists():
+            try:
+                state_dict = _load_checkpoint(model_path, map_location=device)
+                model.load_state_dict(state_dict)
+                logger.info("加载已有模型参数: %s", model_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("增量训练时加载模型失败，将重新训练。原因: %s", exc)
+        else:
+            logger.warning("未找到增量训练模型 %s，将从头开始训练", model_path)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     criterion = torch.nn.MSELoss()      # 这两句是定义优化器和loss
 
@@ -101,7 +130,7 @@ def train(config, logger, train_and_valid_data):
         if valid_loss_cur < valid_loss_min:
             valid_loss_min = valid_loss_cur
             bad_epoch = 0
-            torch.save(model.state_dict(), config.model_save_path + config.model_name)  # 模型保存
+            torch.save(model.state_dict(), model_path)  # 模型保存
         else:
             bad_epoch += 1
             if bad_epoch >= config.patience:    # 如果验证集指标连续patience个epoch没有提升，就停掉训练
@@ -109,16 +138,21 @@ def train(config, logger, train_and_valid_data):
                 break
 
 
-def predict(config, test_X):
+def predict(config, test_X, device):
     # 获取测试数据
     test_X = torch.from_numpy(test_X).float()
     test_set = TensorDataset(test_X)
     test_loader = DataLoader(test_set, batch_size=1)
 
-    # 加载模型
-    device = torch.device("cuda:0" if config.use_cuda and torch.cuda.is_available() else "cpu")
+    device = torch.device(device)
     model = Net(config).to(device)
-    model.load_state_dict(torch.load(config.model_save_path + config.model_name))   # 加载模型参数
+    model_path = _resolve_checkpoint_path(config)
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"未找到模型参数文件: {model_path}. 请先运行训练阶段或提供正确的模型路径。"
+        )
+    state_dict = _load_checkpoint(model_path, map_location=device)
+    model.load_state_dict(state_dict)   # 加载模型参数
 
     # 先定义一个tensor保存预测结果
     result = torch.Tensor().to(device)
