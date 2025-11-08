@@ -1880,10 +1880,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "无交易记录", "当前回测未生成可导出的 PPO 交易记录。")
             return
 
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_filename = f"ppo_trades_{timestamp}.xlsx"
         path, _ = QFileDialog.getSaveFileName(
             self,
             "保存PPO交易记录",
-            os.path.join(os.getcwd(), "ppo_trades.xlsx"),
+            os.path.join(os.getcwd(), default_filename),
             "Excel 文件 (*.xlsx)",
         )
 
@@ -2226,7 +2228,8 @@ class MainWindow(QMainWindow):
         start_dir = os.path.join(os.getcwd(), "reports")
         os.makedirs(start_dir, exist_ok=True)
 
-        default_filename = f"backtest_report_{datetime.now():%Y%m%d_%H%M%S}.html"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_filename = f"backtest_report_{timestamp}.html"
         path, _ = QFileDialog.getSaveFileName(
             self,
             "保存回测报告",
