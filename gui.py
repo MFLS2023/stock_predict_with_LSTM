@@ -185,38 +185,32 @@ class PpoTrainingThread(QThread):
 
 
 class AiBacktestThread(QThread):
-    succeeded = pyqtSignal(object)
+    succeeded = pyqtSignal(dict)
     failed = pyqtSignal(str)
 
     def __init__(
         self,
-        df_test: pd.DataFrame,
         model_path: Path,
+        df_test: pd.DataFrame,
         initial_cash: float,
         monthly_invest: float,
         fee: float,
-        benchmark_df: Optional[pd.DataFrame] = None,
-        benchmark_close: Optional[pd.Series] = None,
     ) -> None:
         super().__init__()
-        self.df_test = df_test
         self.model_path = Path(model_path)
-        self.initial_cash = initial_cash
-        self.monthly_invest = monthly_invest
-        self.fee = fee
-        self.benchmark_df = benchmark_df
-        self.benchmark_close = benchmark_close
+        self.df_test = df_test.copy()
+        self.initial_cash = float(initial_cash)
+        self.monthly_invest = float(monthly_invest)
+        self.fee = float(fee)
 
     def run(self) -> None:
         try:
             result = run_ai_comparison_backtest(
-                self.df_test,
-                self.model_path,
+                model_path=str(self.model_path),
+                df_test=self.df_test,
                 initial_cash=self.initial_cash,
-                monthly_investment_amount=self.monthly_invest,
+                monthly_invest=self.monthly_invest,
                 fee=self.fee,
-                benchmark_df=self.benchmark_df,
-                benchmark_close=self.benchmark_close,
             )
             self.succeeded.emit(result)
         except Exception:
@@ -258,6 +252,7 @@ class MainWindow(QMainWindow):
         self.ai_model_path: Optional[Path] = None
         self.ai_benchmark_df: Optional[pd.DataFrame] = None
         self.ai_last_result: Optional[Dict[str, Any]] = None
+        self.ai_comparison_result: Optional[Dict[str, Any]] = None
 
         self.crosshair_timer = QTimer(self)
         self.crosshair_timer.setSingleShot(True)
@@ -1624,154 +1619,106 @@ class MainWindow(QMainWindow):
         
         self.append_log(f"测试数据准备完成: {len(df_test)} 条记录 ({test_start.date()} 到 {test_end.date()})")
 
-        benchmark_df = None
-        benchmark_series = None
-        if self.ai_benchmark_df is not None:
-            benchmark_df = self.ai_benchmark_df.copy()
-            benchmark_df = benchmark_df.set_index('Date')
-            if 'Close' in benchmark_df.columns:
-                benchmark_series = benchmark_df['Close']
+        self.ai_comparison_result = None
 
         initial_cash = float(self.ai_initial_cash_spin.value())
         monthly_invest = float(self.ai_monthly_spin.value())
         fee = AI_DEFAULT_TRADE_FEE
 
         self.append_log(
-            f"启动 AI 策略回测: {test_start.date()} ~ {test_end.date()} | 初始资金 {initial_cash:.2f} | 月度注资 {monthly_invest:.2f} | 手续费 {fee:.2%} | 模型 {self.ai_model_path}"
+            f"启动 AI 策略对比回测: {test_start.date()} ~ {test_end.date()} | 初始资金 {initial_cash:.2f} | 月度注资 {monthly_invest:.2f} | 手续费 {fee:.2%} | 模型 {self.ai_model_path}"
         )
-        self.status_label.setText("AI 策略回测中...")
+        self.status_label.setText("正在执行策略对比回测...")
         self._set_ai_controls_enabled(False)
         self.ai_progress.setRange(0, 0)
-        self.ai_progress.setFormat("AI 回测中...")
+        self.ai_progress.setFormat("策略对比回测中...")
 
         self.ai_backtest_thread = AiBacktestThread(
-            df_test,
             self.ai_model_path,
+            df_test,
             initial_cash=initial_cash,
             monthly_invest=monthly_invest,
             fee=fee,
-            benchmark_df=benchmark_df,
-            benchmark_close=benchmark_series,
         )
-        self.ai_backtest_thread.succeeded.connect(self._on_ai_backtest_success)
-        self.ai_backtest_thread.failed.connect(self._on_ai_backtest_failed)
+        self.ai_backtest_thread.succeeded.connect(self._on_comparison_backtest_success)
+        self.ai_backtest_thread.failed.connect(self._on_comparison_backtest_failed)
         self.ai_backtest_thread.start()
 
-    def _on_ai_backtest_success(self, result: Dict[str, Any]) -> None:
+    def _on_comparison_backtest_success(self, results: Dict[str, Any]) -> None:
         self.ai_backtest_thread = None
         self._set_ai_controls_enabled(True)
-        self.status_label.setText("AI 策略回测完成")
-        self.ai_last_result = result
-        
-        # 验证回测结果的完整性
-        self.append_log("=== AI 策略回测完成 ===")
-        if 'equity' in result:
-            equity_df = result['equity']
-            self.append_log(f"净值数据形状: {equity_df.shape}")
-            self.append_log(f"净值数据列: {list(equity_df.columns)}")
+        self.status_label.setText("对比回测完成")
+        self.ai_last_result = results
+        self.ai_comparison_result = results
+
+        self.append_log("=== 策略对比回测完成 ===")
+        equity_curves = results.get("equity_curves")
+        if equity_curves:
+            self.append_log(f"获取到 {len(equity_curves)} 条净值曲线：{', '.join(equity_curves.keys())}")
         else:
-            self.append_log("警告：回测结果中缺少净值数据！")
-            
-        if 'metrics' in result:
-            self.append_log(f"指标数据包含: {list(result['metrics'].keys())}")
+            self.append_log("警告：回测结果中未包含净值曲线。")
+
+        metrics = results.get("metrics")
+        if metrics:
+            self.append_log(f"可用指标集合：{', '.join(metrics.keys())}")
         else:
-            self.append_log("警告：回测结果中缺少指标数据！")
-        
-        if 'ai_episode' in result:
-            episode = result['ai_episode']
-            self.append_log(f"AI训练集表现: 最终净值={episode.get('final_nav', 'N/A')}, 交易次数={episode.get('num_trades', 'N/A')}")
-        
+            self.append_log("警告：回测结果中未包含指标数据。")
+
         self.ai_progress.setRange(0, 1)
         self.ai_progress.setValue(1)
         self.ai_progress.setFormat("回测完成")
-        
-        try:
-            self._display_ai_backtest_result(result)
-        except Exception as e:
-            self.append_log(f"显示回测结果时出错: {e}")
-            import traceback
-            self.append_log(traceback.format_exc())
-            QMessageBox.critical(self, "显示错误", f"绘制回测结果图表时出错：{e}")
 
-    def _on_ai_backtest_failed(self, traceback_text: str) -> None:
+        try:
+            self._display_comparison_result(results)
+        except Exception as exc:
+            self.append_log(f"显示回测结果时出错: {exc}")
+            self.append_log(traceback.format_exc())
+            QMessageBox.critical(self, "显示错误", f"绘制策略对比曲线时出错：{exc}")
+
+    def _on_comparison_backtest_failed(self, traceback_text: str) -> None:
         self.ai_backtest_thread = None
         self._set_ai_controls_enabled(True)
-        self.status_label.setText("AI 策略回测失败")
+        self.status_label.setText("策略对比回测失败")
         self.append_log(traceback_text)
-        QMessageBox.critical(self, "AI 回测失败", "回测过程中出现异常，详情请查看日志。")
+        QMessageBox.critical(self, "策略对比回测失败", "回测过程中出现异常，详情请查看日志。")
         self.ai_progress.setRange(0, 1)
         self.ai_progress.setValue(0)
         self.ai_progress.setFormat("回测失败")
 
-    def _display_ai_backtest_result(self, result: Dict[str, Any]) -> None:
-        equity_df: pd.DataFrame = result['equity']
-        drawdown_map: Dict[str, pd.Series] = result['drawdown']
+    def _display_comparison_result(self, results: Dict[str, Any]) -> None:
+        equity_curves = results.get("equity_curves") or {}
+        if not equity_curves:
+            raise ValueError("缺少净值曲线数据，无法绘制比较图。")
         
-        # 调试：检查净值数据
-        self.append_log("=== 回测结果数据检查 ===")
-        self.append_log(f"equity_df 列: {list(equity_df.columns)}")
-        self.append_log(f"equity_df 数据形状: {equity_df.shape}")
-        self.append_log(f"equity_df 索引范围: {equity_df.index[0]} ~ {equity_df.index[-1]}")
-        
-        for col in equity_df.columns:
-            col_data = equity_df[col]
-            self.append_log(f"{col} - 初始: {col_data.iloc[0]:.2f}, 最小值: {col_data.min():.2f}, 最大值: {col_data.max():.2f}, 最终值: {col_data.iloc[-1]:.2f}")
-        
-        # 检查 total_invested 和 AI 策略净值的关系
-        ai_episode = result.get('ai_episode', {})
-        if ai_episode:
-            self.append_log(f"AI Episode Metrics: {ai_episode}")
-        
-        # 检查 metrics 中的 total_invested
-        metrics = result.get('metrics', {})
-        if metrics:
-            for key, metric in metrics.items():
-                if metric:
-                    self.append_log(f"{key} metrics: total_return={metric.get('total_return')}, final_value={equity_df[list(equity_df.columns)[list(metrics.keys()).index(key)]].iloc[-1] if key in ['ai', 'dca', 'buy_and_hold', 'benchmark'] else 'N/A'}")
-
         fig = Figure(figsize=(10, 6))
-        ax_nav = fig.add_subplot(211)
-        color_cycle = ['#d62728', '#2ca02c', '#1f77b4', '#9467bd']
-        for idx, column in enumerate(equity_df.columns):
-            ax_nav.plot(
-                equity_df.index,
-                equity_df[column],
-                label=column,
-                color=color_cycle[idx % len(color_cycle)],
-            )
-        if getattr(self, '_chinese_font_prop', None) is not None:
-            ax_nav.set_title('AI 策略净值对比', fontweight='bold', fontproperties=self._chinese_font_prop)
-            ax_nav.set_ylabel('组合净值（元）', fontproperties=self._chinese_font_prop)
-            ax_nav.legend(loc='upper left', title='策略', prop=self._chinese_font_prop, title_fontproperties=self._chinese_font_prop)
-        else:
-            ax_nav.set_title('AI 策略净值对比', fontweight='bold')
-            ax_nav.set_ylabel('组合净值（元）')
-            ax_nav.legend(loc='upper left', title='策略')
-        ax_nav.yaxis.set_major_formatter(mticker.StrMethodFormatter('{x:,.0f}'))
-        ax_nav.grid(True, linestyle='--', alpha=0.3)
+        ax = fig.add_subplot(111)
+        color_cycle = ['#d62728', '#2ca02c', '#1f77b4', '#9467bd', '#ff7f0e']
 
-        ax_dd = fig.add_subplot(212, sharex=ax_nav)
-        for idx, (name, series) in enumerate(drawdown_map.items()):
-            ax_dd.plot(
-                series.index,
-                series.values,
-                label=f"{name}回撤",
-                color=color_cycle[idx % len(color_cycle)],
-            )
-        ax_dd.axhline(0, color='#444444', linewidth=0.6)
+        for idx, (name, curve) in enumerate(equity_curves.items()):
+            if curve is None:
+                continue
+            if isinstance(curve, pd.DataFrame):
+                for col in curve.columns:
+                    series = curve[col].astype(float)
+                    ax.plot(series.index, series.values, label=f"{name}-{col}", color=color_cycle[idx % len(color_cycle)])
+            else:
+                series = pd.Series(curve)
+                series = series.astype(float)
+                if not isinstance(series.index, pd.DatetimeIndex):
+                    series.index = pd.RangeIndex(start=0, stop=len(series))
+                ax.plot(series.index, series.values, label=name, color=color_cycle[idx % len(color_cycle)])
+
         if getattr(self, '_chinese_font_prop', None) is not None:
-            ax_dd.set_ylabel('回撤幅度', fontproperties=self._chinese_font_prop)
-            ax_dd.set_xlabel('日期', fontproperties=self._chinese_font_prop)
-            ax_dd.set_title('最大回撤对比', fontweight='bold', fontproperties=self._chinese_font_prop)
-            ax_dd.legend(loc='lower left', title='策略', prop=self._chinese_font_prop, title_fontproperties=self._chinese_font_prop)
+            ax.set_title('AI 动态策略 vs 基准策略 净值对比', fontweight='bold', fontproperties=self._chinese_font_prop)
+            ax.set_ylabel('资产净值 (元)', fontproperties=self._chinese_font_prop)
+            ax.legend(loc='upper left', title='策略', prop=self._chinese_font_prop, title_fontproperties=self._chinese_font_prop)
         else:
-            ax_dd.set_ylabel('回撤幅度')
-            ax_dd.set_xlabel('日期')
-            ax_dd.set_title('最大回撤对比', fontweight='bold')
-            ax_dd.legend(loc='lower left', title='策略')
-        ax_dd.yaxis.set_major_formatter(mticker.PercentFormatter(1.0))
-        ax_dd.grid(True, linestyle='--', alpha=0.3)
-        fig.tight_layout()
+            ax.set_title('AI 动态策略 vs 基准策略 净值对比', fontweight='bold')
+            ax.set_ylabel('资产净值 (元)')
+            ax.legend(loc='upper left', title='策略')
+        ax.yaxis.set_major_formatter(mticker.StrMethodFormatter('{x:,.0f}'))
+        ax.grid(True, linestyle='--', alpha=0.3)
+        fig.autofmt_xdate()
 
         self._clear_kline_canvas()
         canvas = FigureCanvas(fig)
@@ -1785,116 +1732,33 @@ class MainWindow(QMainWindow):
         self._kline_mpl_cids = []
         canvas.draw_idle()
 
-        self._last_backtest_result = result
+        self._last_backtest_result = results
         self.export_backtest_button.setEnabled(True)
         self.tabs.setCurrentIndex(0)
 
-        metrics = result.get('metrics', {}) or {}
-        extra_info = result.get('ai_episode', {}) or {}
-        dca_details = result.get('dca_details', {}) or {}
-
-        initial_cash = float(self.ai_initial_cash_spin.value())
+        metrics_combined = results.get('metrics', {}) or {}
 
         def format_currency(val: Any) -> str:
-            return f"{float(val):,.2f}" if isinstance(val, (float, int)) and pd.notna(val) else "无数据"
+            return f"{float(val):,.2f}" if isinstance(val, (float, int)) and pd.notna(val) else "--"
 
         def format_pct(val: Any) -> str:
-            return f"{val * 100:.2f}%" if isinstance(val, (float, int)) and pd.notna(val) else "无数据"
+            return f"{val * 100:.2f}%" if isinstance(val, (float, int)) and pd.notna(val) else "--"
 
-        def format_pct_signed(val: Any) -> str:
-            return f"{val * 100:+.2f}%" if isinstance(val, (float, int)) and pd.notna(val) else "无数据"
-
-        summary_sections: list[str] = []
-
-        # ---- Final equity overview ----
-        final_lines: list[str] = []
-
-        ai_final_nav = None
-        if 'AI策略' in equity_df.columns:
-            ai_final_nav = float(equity_df['AI策略'].iloc[-1])
-            ai_invested = extra_info.get('cash_added')
-            if not isinstance(ai_invested, (float, int)) or not pd.notna(ai_invested):
-                ai_invested = initial_cash
-            line = f"AI策略 最终净值: {format_currency(ai_final_nav)}"
-            if isinstance(ai_invested, (float, int)) and ai_invested > 0:
-                line += f" | 累计投入: {format_currency(ai_invested)}"
-                metrics_return = metrics.get('ai', {}).get('total_return')
-                computed_return = (ai_final_nav - ai_invested) / ai_invested if ai_invested else None
-                if (
-                    isinstance(metrics_return, (float, int))
-                    and computed_return is not None
-                    and abs(computed_return - metrics_return) > 5e-3
-                ):
-                    self.append_log(
-                        f"警告：AI 策略净值换算收益 {computed_return:.4f} 与指标 {metrics_return:.4f} 存在差异，请核对输入数据。"
-                    )
-            final_lines.append(line)
-
-        if '定投策略' in equity_df.columns:
-            dca_final_nav = float(equity_df['定投策略'].iloc[-1])
-            dca_invested = dca_details.get('total_invested')
-            line = f"定投策略 最终净值: {format_currency(dca_final_nav)}"
-            if isinstance(dca_invested, (float, int)) and dca_invested > 0:
-                line += f" | 累计投入: {format_currency(dca_invested)}"
-            final_lines.append(line)
-
-        if '买入持有' in equity_df.columns:
-            buy_hold_final = float(equity_df['买入持有'].iloc[-1])
-            final_lines.append(
-                f"买入持有 最终净值: {format_currency(buy_hold_final)} | 初始投入: {format_currency(initial_cash)}"
-            )
-
-        if '基准指数' in equity_df.columns:
-            benchmark_final = float(equity_df['基准指数'].iloc[-1])
-            final_lines.append(f"基准指数 等权净值: {format_currency(benchmark_final)}")
-
-        if final_lines:
-            summary_sections.append('净值概览：')
-            summary_sections.extend(final_lines)
-
-        # ---- Performance metrics overview ----
-        label_map = {
-            'ai': 'AI策略',
-            'dca': '定投',
-            'buy_and_hold': '买入持有',
-            'benchmark': '基准',
-        }
-        metric_lines: list[str] = []
-        for key, label in label_map.items():
-            metric = metrics.get(key)
+        summary_lines: list[str] = ["净值/收益概览："]
+        for name, metric in metrics_combined.items():
             if not metric:
                 continue
-            parts = [
-                f"{label} 总收益: {format_pct(metric.get('total_return'))}",
-                f"年化: {format_pct(metric.get('annualized_return'))}",
-                f"最大回撤: {format_pct(metric.get('max_drawdown'))}",
-            ]
-            sharpe = metric.get('sharpe')
-            if isinstance(sharpe, (float, int)) and pd.notna(sharpe):
-                parts.append(f"夏普比率: {sharpe:.2f}")
-            metric_lines.append(' | '.join(parts))
+            parts = [name]
+            if "Final Equity" in metric:
+                parts.append(f"最终净值 {format_currency(metric['Final Equity'])}")
+            if "Total Return" in metric:
+                parts.append(f"总收益 {format_pct(metric['Total Return'])}")
+            summary_lines.append(" | ".join(parts))
 
-        ai_return = metrics.get('ai', {}).get('total_return') if metrics else None
-        dca_return = metrics.get('dca', {}).get('total_return') if metrics else None
-        if isinstance(ai_return, (float, int)) and isinstance(dca_return, (float, int)):
-            diff = ai_return - dca_return
-            if diff >= 0:
-                metric_lines.insert(0, f"AI 相对定投超额收益: {format_pct_signed(diff)}")
-            else:
-                metric_lines.insert(0, f"AI 策略仍低于定投 {format_pct_signed(diff)}，建议继续优化训练。")
+        if len(summary_lines) == 1:
+            summary_lines = ["暂未获取到指标数据"]
 
-        if extra_info:
-            metric_lines.append(
-                f"AI 回测统计：最终净值 {format_currency(extra_info.get('final_nav'))} | 交易次数 {extra_info.get('num_trades', 0)}"
-            )
-
-        if metric_lines:
-            if summary_sections:
-                summary_sections.append('')
-            summary_sections.append('指标概览：')
-            summary_sections.extend(metric_lines)
-
-        self.chart_info_label.setText('\n'.join(summary_sections))
+        self.chart_info_label.setText('\n'.join(summary_lines))
 
     def _clear_kline_canvas(self, keep_placeholder: bool = False) -> None:
         # 断开旧的 matplotlib 事件连接
@@ -2203,31 +2067,106 @@ class MainWindow(QMainWindow):
         self.append_log(f"回测指标: {info_text}")
 
     def export_backtest_report(self) -> None:
-        if self._last_backtest_result is None:
+        if self.ai_comparison_result is not None:
+            export_data = self.ai_comparison_result
+        else:
+            export_data = self._last_backtest_result
+
+        if export_data is None:
             QMessageBox.warning(self, "无结果", "没有可导出的回测结果。")
             return
 
         start_dir = os.path.join(os.getcwd(), "reports")
         os.makedirs(start_dir, exist_ok=True)
+
         default_filename = f"backtest_report_{datetime.now():%Y%m%d_%H%M%S}.html"
-        path, _ = QFileDialog.getSaveFileName(self, "保存回测报告", os.path.join(start_dir, default_filename), "HTML 文件 (*.html)")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存回测报告",
+            os.path.join(start_dir, default_filename),
+            "HTML 文件 (*.html)",
+        )
 
         if not path:
             return
 
+        # 对比回测导出：自定义 HTML
+        if isinstance(export_data, dict) and "equity_curves" in export_data:
+            try:
+                equity_curves = export_data.get("equity_curves", {}) or {}
+                metrics = export_data.get("metrics", {}) or {}
+
+                curve_map: Dict[str, pd.Series] = {}
+                for name, curve in equity_curves.items():
+                    if curve is None:
+                        continue
+                    if isinstance(curve, pd.DataFrame):
+                        for col in curve.columns:
+                            curve_map[f"{name}-{col}"] = pd.Series(curve[col]).astype(float)
+                    else:
+                        curve_map[name] = pd.Series(curve).astype(float)
+
+                equity_df = pd.DataFrame(curve_map)
+                equity_df.index.name = "Index"
+
+                metrics_rows = []
+                for strategy, metric in metrics.items():
+                    row = {"策略": strategy}
+                    for key, value in (metric or {}).items():
+                        if isinstance(value, (float, int)):
+                            row[key] = f"{value:.6f}" if abs(value) < 1 else f"{value:.4f}"
+                        else:
+                            row[key] = value
+                    metrics_rows.append(row)
+                metrics_df = pd.DataFrame(metrics_rows)
+
+                html_parts = [
+                    "<html><head><meta charset='utf-8'><title>策略对比回测报告</title>",
+                    "<style>body{font-family:Segoe UI, Arial, sans-serif;padding:20px;}table{border-collapse:collapse;width:100%;margin-bottom:20px;}th,td{border:1px solid #ccc;padding:8px;text-align:right;}th{background:#f5f5f5;text-align:center;}td:first-child,th:first-child{text-align:left;}</style>",
+                    "</head><body>",
+                    "<h1>策略对比回测报告</h1>",
+                    f"<p>导出时间：{datetime.now():%Y-%m-%d %H:%M:%S}</p>",
+                ]
+
+                if not metrics_df.empty:
+                    html_parts.append("<h2>核心指标</h2>")
+                    html_parts.append(metrics_df.to_html(index=False, escape=False))
+                else:
+                    html_parts.append("<p>暂无指标数据。</p>")
+
+                if not equity_df.empty:
+                    html_parts.append("<h2>净值曲线数据</h2>")
+                    html_parts.append(equity_df.to_html())
+                else:
+                    html_parts.append("<p>暂无净值曲线数据。</p>")
+
+                html_parts.append("</body></html>")
+
+                with open(path, "w", encoding="utf-8") as fout:
+                    fout.write("\n".join(html_parts))
+
+                self.append_log(f"策略对比回测报告已保存至: {path}")
+                QMessageBox.information(self, "导出成功", f"策略对比回测报告已保存至:\n{path}")
+            except Exception as exc:  # noqa: BLE001
+                self.append_log(f"导出策略对比报告失败: {exc}\n{traceback.format_exc()}")
+                QMessageBox.critical(self, "导出失败", f"导出报告时出错: {exc}")
+            return
+
+        # 传统 backtesting 导出
         try:
             from backtesting import plotting
+
             plotting.plot(
-                self._last_backtest_result,
+                export_data,
                 filename=path,
                 open_browser=True,
                 resample=False,
             )
             self.append_log(f"回测报告已保存至: {path}")
             QMessageBox.information(self, "导出成功", f"报告已保存至:\n{path}")
-        except Exception as e:
-            self.append_log(f"导出报告失败: {e}\n{traceback.format_exc()}")
-            QMessageBox.critical(self, "导出失败", f"导出报告时出错: {e}")
+        except Exception as exc:  # noqa: BLE001
+            self.append_log(f"导出报告失败: {exc}\n{traceback.format_exc()}")
+            QMessageBox.critical(self, "导出失败", f"导出报告时出错: {exc}")
 
     def closeEvent(self, event) -> None:
         """确保在关闭窗口时，所有后台线程都能被正确终止。"""
