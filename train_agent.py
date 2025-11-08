@@ -16,7 +16,8 @@ class LoggingCallback(BaseCallback):
         # Log every 1000 steps
         if self.num_timesteps % 1000 == 0:
             # You can access logger data and log it
-            reward = self.logger.get_latest_key_value('rollout/ep_rew_mean')
+            # 直接从日志记录器的内部字典中获取值
+            reward = self.logger.name_to_value.get('rollout/ep_rew_mean')
             if self.log_callback and reward is not None:
                 self.log_callback(f"Timestep: {self.num_timesteps}, Mean Reward: {reward:.2f}")
         return True

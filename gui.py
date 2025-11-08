@@ -32,13 +32,7 @@ import pandas as pd
 
 from backtest import run_ai_comparison_backtest, run_backtest, run_grid_backtest
 
-from ai_strategy import (
-    TrainingArtifact,
-    TrainingConfig,
-    auto_calibrate_training_config,
-    train_ai_strategy,
-)
-from ai_strategy import load_artifact as load_ai_artifact
+from train_agent import train_ppo_model
 
 from main import Config, FRAME_MODULES, main as run_pipeline
 
@@ -152,56 +146,40 @@ class WorkerThread(QThread):
             self.handler.close()
 
 
-class AiTrainingThread(QThread):
-    succeeded = pyqtSignal(object)
+class PpoTrainingThread(QThread):
+    succeeded = pyqtSignal(str)
     failed = pyqtSignal(str)
-    progress = pyqtSignal(int, int, float, float, object)
+    log_message = pyqtSignal(str)
 
     def __init__(
         self,
         df_train: pd.DataFrame,
-        framework: str,
-        config: TrainingConfig,
+        total_timesteps: int,
         output_dir: Path,
-        benchmark: Optional[pd.Series] = None,
-        initial_cash: float = 100_000.0,
+        model_filename: str,
+        device: str = "auto",
     ) -> None:
         super().__init__()
         self.df_train = df_train
-        self.framework = framework
-        self.config = config
+        self.total_timesteps = int(total_timesteps)
         self.output_dir = output_dir
-        self.benchmark = benchmark
-        self.initial_cash = float(initial_cash)
-        self._start_time: float = 0.0
+        self.model_filename = model_filename
+        self.device = device
 
     def run(self) -> None:
+        def emit_log(message: str) -> None:
+            self.log_message.emit(message)
+
         try:
-            self._start_time = time.perf_counter()
-
-            def handle_progress(epoch: float, total_epochs: int, metrics: Dict[str, Any]) -> None:
-                elapsed = max(time.perf_counter() - self._start_time, 0.0)
-                progress_ratio = metrics.get("progress_ratio")
-                if progress_ratio is not None and progress_ratio > 0:
-                    eta = max(elapsed * (1.0 - progress_ratio) / progress_ratio, 0.0)
-                elif epoch <= 0:
-                    eta = 0.0
-                else:
-                    avg_epoch_time = elapsed / max(epoch, 1.0)
-                    eta = max((total_epochs - epoch) * avg_epoch_time, 0.0)
-                self.progress.emit(epoch, total_epochs, elapsed, eta, metrics)
-
-            artifact = train_ai_strategy(
-                self.df_train,
-                framework=self.framework,
-                config=self.config,
+            saved_path = train_ppo_model(
+                df_train=self.df_train,
+                total_timesteps=self.total_timesteps,
                 output_dir=self.output_dir,
-                benchmark_close=self.benchmark,
-                verbose=False,
-                initial_cash=self.initial_cash,
-                progress_callback=handle_progress,
+                model_filename=self.model_filename,
+                device=self.device,
+                log_callback=emit_log,
             )
-            self.succeeded.emit(artifact)
+            self.succeeded.emit(str(saved_path))
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -213,7 +191,7 @@ class AiBacktestThread(QThread):
     def __init__(
         self,
         df_test: pd.DataFrame,
-        artifact: TrainingArtifact,
+        model_path: Path,
         initial_cash: float,
         monthly_invest: float,
         fee: float,
@@ -222,7 +200,7 @@ class AiBacktestThread(QThread):
     ) -> None:
         super().__init__()
         self.df_test = df_test
-        self.artifact = artifact
+        self.model_path = Path(model_path)
         self.initial_cash = initial_cash
         self.monthly_invest = monthly_invest
         self.fee = fee
@@ -233,7 +211,7 @@ class AiBacktestThread(QThread):
         try:
             result = run_ai_comparison_backtest(
                 self.df_test,
-                self.artifact,
+                self.model_path,
                 initial_cash=self.initial_cash,
                 monthly_investment_amount=self.monthly_invest,
                 fee=self.fee,
@@ -275,10 +253,9 @@ class MainWindow(QMainWindow):
         self._log_buffer: list[str] = []
 
         # AI 策略线程与状态
-        self.ai_training_thread: Optional[AiTrainingThread] = None
+        self.ai_training_thread: Optional[PpoTrainingThread] = None
         self.ai_backtest_thread: Optional[AiBacktestThread] = None
-        self.ai_artifact: Optional[TrainingArtifact] = None
-        self.ai_artifact_dir: Optional[Path] = None
+        self.ai_model_path: Optional[Path] = None
         self.ai_benchmark_df: Optional[pd.DataFrame] = None
         self.ai_last_result: Optional[Dict[str, Any]] = None
 
@@ -1532,134 +1509,60 @@ class MainWindow(QMainWindow):
                 f"所选框架当前不可用，请检查依赖安装：\n{info['error']}",
             )
             return
-        output_dir = Path("checkpoint") / "ai_runs" / f"{datetime.now():%Y%m%d_%H%M%S}_{framework}"
-        benchmark_series = self._get_benchmark_series()
 
-        initial_cash = float(self.ai_initial_cash_spin.value())
-        monthly_cash = float(self.ai_monthly_spin.value())
-
-        config = auto_calibrate_training_config(
-            df_train,
-            monthly_cash=monthly_cash,
-            fee=AI_DEFAULT_TRADE_FEE,
-            benchmark_close=benchmark_series,
-        )
-
-        config.total_timesteps = int(self.ai_total_timesteps_spin.value())
-
-        # 使用用户设置的训练轮次，而非自动调参的轮次（便于测试）
-        auto_suggested_epochs = config.epochs  # 保存自动调参建议的值
-        user_epochs = int(self.ai_epoch_spin.value())
-        config.epochs = user_epochs
-        self.append_log(f"使用手动设置的 Epoch: {user_epochs}（自动调参建议值: {auto_suggested_epochs}）")
-        if auto_suggested_epochs > 0:
-            if user_epochs < 0.5 * auto_suggested_epochs:
-                self.append_log(
-                    "提示：当前手动 Epoch 远低于自动建议值，可能导致模型尚未充分学习，建议适当增加训练轮次。"
-                )
-            elif user_epochs > 1.5 * auto_suggested_epochs:
-                self.append_log(
-                    "提示：手动 Epoch 明显高于自动建议值，若训练过久出现过拟合，可尝试降低轮次或开启早停。"
-                )
-
-        # 设备偏好设置（auto / cpu / gpu / cuda:0 等）
-        device_data = self.ai_device_combo.currentData()
-        if device_data is None:
-            pref = 'auto'
-        else:
-            pref = device_data
-        config.device_preference = pref
-        
-        # 创建logger并传递给config，使AI Agent能输出设备信息到GUI日志窗口
-        ai_logger = logging.getLogger("ai_strategy")
-        ai_logger.setLevel(logging.INFO)
-        ai_logger.handlers.clear()  # 清除旧的handler
-        
-        # 使用QtLogHandler将日志输出到GUI
-        qt_handler = QtLogHandler()
-        qt_handler.signal.message.connect(self.append_log)
-        ai_logger.addHandler(qt_handler)
-        config.logger = ai_logger
-
-        # 记录系统中可见的加速设备信息，便于用户确认
-        try:
-            _torch = importlib.import_module("torch")
-            if _torch is not None and _torch.cuda.is_available():
-                names = [_torch.cuda.get_device_name(i) for i in range(_torch.cuda.device_count())]
-                self.append_log(f"检测到 PyTorch GPU: {', '.join(names)}")
-            else:
-                self.append_log("未检测到可用的 PyTorch GPU。")
-        except Exception:
-            pass
-        try:
-            import importlib
-
-            _tf = importlib.import_module("tensorflow")
-        except Exception:
-            _tf = None
-        if _tf is not None:
-            try:
-                gpus = _tf.config.list_physical_devices('GPU')
-            except Exception:
-                gpus = []
-            if gpus:
-                self.append_log(f"检测到 TensorFlow GPU: {len(gpus)} 个")
-            else:
-                self.append_log("未检测到可用的 TensorFlow GPU。")
-
-        # 显示自动调参结果，Epoch已被手动覆盖
-        self.ai_hyperparam_label.setText(
-            (
-                f"自动调参：Batch={config.batch_size} | "
-                f"学习率 {config.learning_rate:.4f} | 止损≈{config.stop_loss_init:.1%} | 止盈≈{config.take_profit_init:.1%}\n"
-                f"Epoch: 手动设置={user_epochs}（自动建议={auto_suggested_epochs}）"
+        if framework != "pytorch":
+            QMessageBox.information(
+                self,
+                "暂未支持",
+                "当前的 PPO 训练仅支持 PyTorch，请在框架选择中选择 PyTorch。",
             )
+            return
+
+        total_timesteps = int(self.ai_total_timesteps_spin.value())
+        if total_timesteps <= 0:
+            QMessageBox.warning(self, "参数错误", "训练步数必须大于 0。")
+            return
+
+        device_data = self.ai_device_combo.currentData()
+        device = str(device_data) if device_data is not None else "auto"
+
+        output_dir = Path("checkpoint") / "ai_runs" / f"{datetime.now():%Y%m%d_%H%M%S}_{framework}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        model_filename = "ppo_model.zip"
+
+        framework_name = FRAME_DISPLAY_NAMES.get(framework, framework.title())
+        self.ai_hyperparam_label.setText(
+            f"PPO 训练参数：框架 {framework_name} | 总步数 {total_timesteps:,} | 设备 {device}"
         )
 
         self.append_log(
-            f"启动 AI 策略训练: 框架={framework}, Epoch={config.epochs}(手动), Batch={config.batch_size}, "
-            f"LR={config.learning_rate:.5f}, 止损≈{config.stop_loss_init:.2%}, 止盈≈{config.take_profit_init:.2%}, 设备={pref}"
+            f"启动 PPO 训练：样本 {len(df_train)} 条 | 总步数 {total_timesteps:,} | 设备 {device} | 输出目录 {output_dir}"
         )
         self.status_label.setText("AI 策略训练中...")
         self.ai_artifact_label.setText("训练进行中...")
         self._set_ai_controls_enabled(False)
-        self.ai_progress.setRange(0, 100)
-        self.ai_progress.setValue(0)
-        self.ai_progress.setFormat("0.0% | 预计剩余 --")
+        self.ai_progress.setRange(0, 0)
+        self.ai_progress.setFormat("AI 训练中...")
 
-        self.ai_training_thread = AiTrainingThread(
-            df_train,
-            framework,
-            config,
-            output_dir,
-            benchmark_series,
-            initial_cash=initial_cash,
+        self.ai_training_thread = PpoTrainingThread(
+            df_train=df_train.copy(),
+            total_timesteps=total_timesteps,
+            output_dir=output_dir,
+            model_filename=model_filename,
+            device=device,
         )
+        self.ai_training_thread.log_message.connect(self.append_log)
         self.ai_training_thread.succeeded.connect(self._on_ai_training_success)
         self.ai_training_thread.failed.connect(self._on_ai_training_failed)
-        self.ai_training_thread.progress.connect(self._on_ai_training_progress)
         self.ai_training_thread.start()
 
-    def _on_ai_training_success(self, artifact: TrainingArtifact) -> None:
+    def _on_ai_training_success(self, model_path: str) -> None:
         self.ai_training_thread = None
         self._set_ai_controls_enabled(True)
-        self.ai_artifact = artifact
-        self.ai_artifact_dir = Path(artifact.model_path).parent
-        best_epoch = artifact.best_epoch or 0
-        best_nav = None
-        if artifact.best_metrics:
-            best_nav_val = artifact.best_metrics.get("final_nav")
-            if isinstance(best_nav_val, (int, float)):
-                best_nav = best_nav_val
-        label_lines = []
-        if best_epoch and best_nav is not None:
-            label_lines.append(f"最佳轮次: Epoch {best_epoch} | 净值 {best_nav:,.2f}")
-        label_lines.append(f"模型目录: {self.ai_artifact_dir}")
-        self.ai_artifact_label.setText("\n".join(label_lines))
+        self.ai_model_path = Path(model_path)
         self.status_label.setText("AI 策略训练完成")
-        self.append_log(f"AI 策略训练完成，模型已保存至 {artifact.model_path}")
-        if best_epoch and best_nav is not None:
-            self.append_log(f"最佳 Epoch {best_epoch} 的终值净值为 {best_nav:,.2f}")
+        self.append_log(f"AI 策略训练完成，模型已保存至 {model_path}")
+        self.ai_artifact_label.setText(f"模型路径: {self.ai_model_path}")
         self.ai_progress.setRange(0, 100)
         self.ai_progress.setValue(100)
         self.ai_progress.setFormat("训练完成")
@@ -1690,74 +1593,14 @@ class MainWindow(QMainWindow):
             return f"{secs}秒"
         return "<1秒"
 
-    def _on_ai_training_progress(
-        self,
-        epoch: int,
-        total_epochs: int,
-        elapsed: float,
-        eta: float,
-        metrics: Dict[str, Any],
-    ) -> None:
-        if total_epochs <= 0:
-            return
-
-        ratio_from_metrics = metrics.get("progress_ratio")
-        if isinstance(ratio_from_metrics, (int, float)):
-            progress_ratio = max(0.0, min(float(ratio_from_metrics), 1.0))
-        else:
-            progress_ratio = max(0.0, min(float(epoch) / float(total_epochs), 1.0))
-
-        percent = progress_ratio * 100.0
-        self.ai_progress.setRange(0, 100)
-        self.ai_progress.setValue(int(percent))
-        eta_text = self._format_duration(eta)
-        self.ai_progress.setFormat(f"{percent:5.1f}% | 预计剩余 {eta_text}")
-
-        elapsed_text = self._format_duration(elapsed)
-        epoch_progress = metrics.get("epoch_progress")
-        if isinstance(epoch_progress, (int, float)):
-            current_epoch_display = max(0.0, min(float(total_epochs), float(epoch_progress)))
-        else:
-            current_epoch_display = float(epoch)
-
-        epoch_text = f"{current_epoch_display:.1f}" if total_epochs > 1 else f"{current_epoch_display:.0f}"
-        self.status_label.setText(
-            f"AI 策略训练中：第 {epoch_text}/{total_epochs} 轮 | 已用时 {elapsed_text} | 剩余 {eta_text}"
-        )
-
-        nav = metrics.get("final_nav")
-        invested = metrics.get("cash_added")
-        reward = metrics.get("reward")
-        if isinstance(nav, (int, float)) and isinstance(reward, (int, float)):
-            display_parts = [f"当前净值 {nav:,.2f}"]
-            if isinstance(invested, (int, float)) and invested > 0:
-                roi = (nav - invested) / invested
-                display_parts.append(f"累计投入 {invested:,.2f}")
-                display_parts.append(f"收益 {roi * 100:.2f}%")
-            display_parts.append(f"奖励 {reward:.2f}")
-
-            summary_line = " | ".join(display_parts)
-
-            best_nav = metrics.get("best_final_nav")
-            best_epoch = metrics.get("best_epoch_so_far")
-            best_invested = metrics.get("best_cash_added") or invested
-            if isinstance(best_epoch, int) and isinstance(best_nav, (int, float)) and best_epoch > 0:
-                best_line_parts = [f"Epoch {best_epoch} | 净值 {best_nav:,.2f}"]
-                if isinstance(best_invested, (int, float)) and best_invested > 0:
-                    best_roi = (best_nav - best_invested) / best_invested
-                    best_line_parts.append(f"累计投入 {best_invested:,.2f}")
-                    best_line_parts.append(f"收益 {best_roi * 100:.2f}%")
-                best_line = " | ".join(best_line_parts)
-                self.ai_artifact_label.setText(f"当前进度：{summary_line}\n最佳表现：{best_line}")
-            else:
-                self.ai_artifact_label.setText(f"当前进度：{summary_line}")
-
     def _start_ai_backtest(self) -> None:
         if self.full_df is None or self.full_df.empty:
             QMessageBox.warning(self, "缺少数据", "请先在图表分析页加载目标数据。")
             return
-        if self.ai_artifact is None:
+        if self.ai_model_path is None or not self.ai_model_path.exists():
             QMessageBox.information(self, "缺少模型", "请先训练 AI 策略模型后再执行回测。")
+            if self.ai_model_path is not None:
+                self.append_log(f"提示：已记录的模型路径不存在：{self.ai_model_path}")
             return
 
         test_start = pd.Timestamp(self.ai_test_start.date().toPyDate())
@@ -1794,7 +1637,7 @@ class MainWindow(QMainWindow):
         fee = AI_DEFAULT_TRADE_FEE
 
         self.append_log(
-            f"启动 AI 策略回测: {test_start.date()} ~ {test_end.date()} | 初始资金 {initial_cash:.2f} | 月度注资 {monthly_invest:.2f} | 手续费 {fee:.2%}"
+            f"启动 AI 策略回测: {test_start.date()} ~ {test_end.date()} | 初始资金 {initial_cash:.2f} | 月度注资 {monthly_invest:.2f} | 手续费 {fee:.2%} | 模型 {self.ai_model_path}"
         )
         self.status_label.setText("AI 策略回测中...")
         self._set_ai_controls_enabled(False)
@@ -1803,7 +1646,7 @@ class MainWindow(QMainWindow):
 
         self.ai_backtest_thread = AiBacktestThread(
             df_test,
-            self.ai_artifact,
+            self.ai_model_path,
             initial_cash=initial_cash,
             monthly_invest=monthly_invest,
             fee=fee,
