@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import numpy as np
 
 try:
     from backtesting import Backtest, Strategy
@@ -20,15 +20,6 @@ except ImportError:  # pragma: no cover - 延迟到调用处提示
     PPO = None  # type: ignore
 
 from ai_strategy import DynamicGridEnv
-
-
-@dataclass
-class StrategyResult:
-    """封装策略回测返回的统一结构。"""
-
-    equity_curve: pd.Series
-    metrics: Dict[str, Any]
-    extra: Dict[str, Any]
 
 def run_backtest(df: pd.DataFrame, initial_cash=100_000):
     """
@@ -62,30 +53,58 @@ def run_backtest(df: pd.DataFrame, initial_cash=100_000):
     }, inplace=True)
     bt_df = bt_df.set_index('Date')
 
-    # 运行回测
     bt = Backtest(bt_df, ZhixingMaStrategy, cash=initial_cash, commission=.001)
     stats = bt.run()
-    
-    # 返回一个包含关键结果的字典，方便GUI调用
-    result = {
-        "stats": stats,
-        "trades": stats['_trades'],
-        "equity_curve": stats['_equity_curve']['Equity'],
-        "metrics": {
+
+    equity_curve = stats['_equity_curve']['Equity']
+    equity_curve.name = "智行均线策略"
+
+    trade_log: List[Dict[str, Any]] = []
+    trades_df_raw = stats.get('_trades')
+    trades_df = pd.DataFrame(trades_df_raw) if trades_df_raw is not None else pd.DataFrame()
+    if not trades_df.empty:
+        trades_df = trades_df.reset_index(drop=True)
+        for _, row in trades_df.iterrows():
+            exit_time = row.get('ExitTime') or row.get('EntryTime')
+            exit_price = row.get('ExitPrice', row.get('Price', row.get('EntryPrice', 0.0)))
+            size = float(abs(row.get('Size', 0.0)))
+            pnl = float(row.get('PnL', 0.0))
+            commission = float(row.get('EntryCommission', 0.0) or 0.0) + float(row.get('ExitCommission', 0.0) or 0.0)
+            trade_log.append(
+                {
+                    "时间": exit_time,
+                    "方向": "卖出",
+                    "价格": float(exit_price),
+                    "数量": size,
+                    "金额": pnl,
+                    "手续费": commission,
+                    "盈亏": pnl,
+                }
+            )
+
+    metrics = _calculate_metrics(equity_curve, trade_log)
+    metrics.update(
+        {
             "Total Return": stats['Return [%]'] / 100,
             "Annualized Return": stats['Return (Ann.) [%]'] / 100,
-            "Max Drawdown": -stats['Max. Drawdown [%]'] / 100,
-            "Sharpe Ratio": stats['Sharpe Ratio'],
-            "Win Rate": stats['Win Rate [%]'] / 100,
-            "Total Trades": stats['# Trades'],
-            "Final Equity": stats['Equity Final [$]'],
+            "Max Drawdown (BT)": -stats['Max. Drawdown [%]'] / 100,
+            "Sharpe Ratio (BT)": stats['Sharpe Ratio'],
+            "Win Rate (BT)": stats['Win Rate [%]'] / 100,
+            "Total Trades (BT)": stats['# Trades'],
+            "Final Equity (BT)": stats['Equity Final [$]'],
+        }
+    )
+
+    return {
+        "equity_curve": equity_curve,
+        "metrics": metrics,
+        "trades_df": pd.DataFrame(trade_log),
+        "actions_df": pd.DataFrame(),
+        "raw": {
+            "stats": stats,
+            "trades": trades_df_raw,
         },
-        # backtesting.py 的 plot() 函数需要原始的 _strategy 对象
-        "_strategy": stats['_strategy'], 
-        "_equity_curve_df": stats['_equity_curve']
     }
-    # bt.plot() # 不在函数内直接绘图，由调用方决定
-    return result
 
 def run_grid_backtest(*args, **kwargs):
     """网格策略回测的占位符函数。"""
@@ -103,6 +122,55 @@ def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     return df.copy()
 
 
+def _calculate_metrics(equity_curve: pd.Series, trade_log: List[Dict[str, Any]]) -> Dict[str, Any]:
+    cleaned_curve = equity_curve.dropna()
+    if cleaned_curve.empty:
+        return {
+            "总回报率": 0.0,
+            "年化回报率": 0.0,
+            "最大回撤": 0.0,
+            "夏普比率": 0.0,
+            "胜率": 0.0,
+            "总交易次数": len(trade_log),
+            "最终净值": 0.0,
+        }
+
+    start_value = float(cleaned_curve.iloc[0])
+    end_value = float(cleaned_curve.iloc[-1])
+    total_return = (end_value / max(start_value, 1e-8)) - 1.0
+
+    rolling_max = cleaned_curve.cummax()
+    drawdowns = cleaned_curve / rolling_max.replace(0, np.nan) - 1.0
+    max_drawdown = float(drawdowns.min()) if not drawdowns.empty else 0.0
+
+    if isinstance(cleaned_curve.index, pd.DatetimeIndex) and len(cleaned_curve) > 1:
+        days = max((cleaned_curve.index[-1] - cleaned_curve.index[0]).days, 1)
+        annualized = (1 + total_return) ** (365 / days) - 1 if days > 0 else total_return
+    else:
+        periods = max(len(cleaned_curve) - 1, 1)
+        annualized = (1 + total_return) ** (252 / periods) - 1 if periods > 0 else total_return
+
+    daily_returns = cleaned_curve.pct_change().dropna()
+    if not daily_returns.empty and daily_returns.std() > 0:
+        sharpe_ratio = float((daily_returns.mean() / daily_returns.std()) * np.sqrt(252))
+    else:
+        sharpe_ratio = 0.0
+
+    sell_trades = [t for t in trade_log if str(t.get("方向")) == "卖出"]
+    winning_sells = sum(1 for t in sell_trades if float(t.get("盈亏", t.get("金额", 0.0))) > 0)
+    win_rate = winning_sells / len(sell_trades) if sell_trades else 0.0
+
+    return {
+        "总回报率": float(total_return),
+        "年化回报率": float(annualized),
+        "最大回撤": float(max_drawdown),
+        "夏普比率": float(sharpe_ratio),
+        "胜率": float(win_rate),
+        "总交易次数": len(trade_log),
+        "最终净值": end_value,
+    }
+
+
 def run_ppo_backtest(
     model_path: str,
     df_test: pd.DataFrame,
@@ -110,12 +178,8 @@ def run_ppo_backtest(
     *,
     monthly_invest: float = 0.0,
     fee: float = 0.001,
-) -> StrategyResult:
-    """
-    使用已训练好的 PPO 模型执行回测。
-
-    返回值统一使用 StrategyResult 以便 GUI 层消费。
-    """
+) -> Dict[str, Any]:
+    """执行 PPO 策略回测并返回完整分析所需的数据。"""
 
     if PPO is None:  # pragma: no cover - 提示用户安装
         raise ImportError(
@@ -144,10 +208,10 @@ def run_ppo_backtest(
 
     print(f"开始执行PPO回测，模型: {resolved_path}")
 
+    df_prepared = _ensure_datetime_index(df_test)
     model = PPO.load(str(resolved_path))
-
     env = DynamicGridEnv(
-        df=df_test.copy(),
+        df=df_prepared,
         initial_cash=float(initial_cash),
         monthly_invest=float(monthly_invest),
         fee=float(fee),
@@ -156,31 +220,130 @@ def run_ppo_backtest(
     obs, info = env.reset()
     terminated = False
     truncated = False
+    trade_log: List[Dict[str, Any]] = []
+    action_log: List[List[float]] = []
 
     while not (terminated or truncated):
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, terminated, truncated, info = env.step(action)
+        action_log.append(list(info.get("last_action", action.tolist())))
+        step_trades = info.get("trades") or []
+        trade_log.extend(step_trades)
 
     equity_curve = env.get_nav_series()
-    if equity_curve.empty:
-        equity_curve = pd.Series([initial_cash], name="AI策略")
+    equity_curve.name = "PPO 动态策略"
 
-    total_return = equity_curve.iloc[-1] / max(initial_cash, 1e-8) - 1.0
+    action_columns = ["网格间距", "止损比例", "仓位比例"]
+    action_count = len(action_log)
+    if action_count > 0:
+        if len(equity_curve) > 1:
+            action_index = equity_curve.index[1 : min(len(equity_curve), action_count + 1)]
+        else:
+            action_index = pd.RangeIndex(start=0, stop=action_count)
+        if len(action_index) != action_count:
+            action_index = pd.RangeIndex(start=0, stop=action_count)
+        actions_df = pd.DataFrame(action_log, columns=action_columns, index=action_index)
+    else:
+        actions_df = pd.DataFrame(columns=action_columns)
 
-    metrics: Dict[str, Any] = {
-        "Total Return": total_return,
-        "Final Equity": equity_curve.iloc[-1],
-        "Total Reward": env.total_reward,
-        "Trades": len(env.trades),
+    trades_df = pd.DataFrame(trade_log)
+    if not trades_df.empty and "时间" in trades_df.columns:
+        trades_df["时间"] = pd.to_datetime(trades_df["时间"], errors="ignore")
+
+    metrics = _calculate_metrics(equity_curve, trade_log)
+    metrics.update(
+        {
+            "总收益奖励": float(env.total_reward),
+            "投入资金": float(env.cash_added),
+        }
+    )
+
+    return {
+        "equity_curve": equity_curve,
+        "metrics": metrics,
+        "actions_df": actions_df,
+        "trades_df": trades_df,
+        "raw": {
+            "nav_history": env.nav_history,
+            "trades": env.trades,
+            "cash_added": env.cash_added,
+        },
     }
 
-    extra: Dict[str, Any] = {
-        "trades": env.trades,
-        "cash_added": env.cash_added,
-        "nav_history_raw": env.nav_history,
-    }
 
-    return StrategyResult(equity_curve=equity_curve, metrics=metrics, extra=extra)
+def run_dca_backtest(
+    df_test: pd.DataFrame,
+    initial_cash: float,
+    monthly_investment: float,
+    *,
+    fee: float = 0.001,
+) -> Dict[str, Any]:
+    """按月定投策略回测，返回统一格式的数据结构。"""
+
+    df_prepared = _ensure_datetime_index(df_test)
+    cash = float(initial_cash)
+    shares_held = 0.0
+    equity_values: List[float] = []
+    equity_index: List[Any] = []
+    trade_log: List[Dict[str, Any]] = []
+    total_invested = float(initial_cash)
+    last_month: Optional[tuple[int, int]] = None
+
+    for date, row in df_prepared.iterrows():
+        price = float(row.get("Close", 0.0))
+        if not np.isfinite(price) or price <= 0:
+            equity_values.append(cash + shares_held * max(price, 0.0))
+            equity_index.append(date)
+            continue
+
+        month_key: Optional[tuple[int, int]] = None
+        if isinstance(df_prepared.index, pd.DatetimeIndex):
+            month_key = (int(date.year), int(date.month))  # type: ignore[union-attr]
+
+        if month_key is None or month_key != last_month:
+            if month_key is not None and monthly_investment > 0:
+                cash += monthly_investment
+                total_invested += monthly_investment
+        last_month = month_key
+
+        if cash > 0:
+            commission = cash * fee
+            shares_bought = (cash - commission) / price
+            if shares_bought > 0:
+                trade_log.append(
+                    {
+                        "时间": date,
+                        "方向": "买入",
+                        "价格": price,
+                        "数量": float(shares_bought),
+                        "金额": -float(cash),
+                        "手续费": float(commission),
+                        "盈亏": 0.0,
+                    }
+                )
+                shares_held += shares_bought
+                cash = 0.0
+
+        equity_values.append(cash + shares_held * price)
+        equity_index.append(date)
+
+    equity_curve = pd.Series(equity_values, index=equity_index, name="定投策略")
+    trades_df = pd.DataFrame(trade_log)
+    if not trades_df.empty and "时间" in trades_df.columns:
+        trades_df["时间"] = pd.to_datetime(trades_df["时间"], errors="ignore")
+
+    metrics = _calculate_metrics(equity_curve, trade_log)
+    metrics.update({"总投入金额": total_invested})
+
+    return {
+        "equity_curve": equity_curve,
+        "metrics": metrics,
+        "trades_df": trades_df,
+        "actions_df": pd.DataFrame(),
+        "raw": {
+            "total_invested": total_invested,
+        },
+    }
 
 
 def run_ai_comparison_backtest(
@@ -188,12 +351,10 @@ def run_ai_comparison_backtest(
     df_test: pd.DataFrame,
     *,
     initial_cash: float = 100_000.0,
+    monthly_investment: float = 0.0,
     fee: float = 0.001,
-    monthly_invest: float = 0.0,
 ) -> Dict[str, Any]:
-    """
-    调度 PPO 策略与基准策略回测，并返回对比所需的全部结果。
-    """
+    """调度多策略回测并返回综合对比结果。"""
 
     print("开始执行策略对比回测...")
 
@@ -203,48 +364,55 @@ def run_ai_comparison_backtest(
         model_path=model_path,
         df_test=df_prepared,
         initial_cash=initial_cash,
-        monthly_invest=monthly_invest,
+        monthly_invest=monthly_investment,
         fee=fee,
     )
 
-    baseline_df = df_prepared.reset_index().rename(columns={"index": "Date"}) if isinstance(df_prepared.index, pd.DatetimeIndex) else df_prepared.copy()
-    zhixing_result_raw = run_backtest(baseline_df, initial_cash=initial_cash)
-    zhixing_result = StrategyResult(
-        equity_curve=zhixing_result_raw["equity_curve"],
-        metrics=zhixing_result_raw["metrics"],
-        extra={"stats": zhixing_result_raw.get("stats"), "trades": zhixing_result_raw.get("trades")},
+    baseline_input = (
+        df_prepared.reset_index().rename(columns={"index": "Date"})
+        if isinstance(df_prepared.index, pd.DatetimeIndex)
+        else df_prepared.copy()
+    )
+    zhixing_result = run_backtest(baseline_input, initial_cash=initial_cash)
+
+    dca_result = run_dca_backtest(
+        df_test=df_prepared,
+        initial_cash=initial_cash,
+        monthly_investment=monthly_investment,
+        fee=fee,
     )
 
-    if "Close" not in df_prepared.columns:
-        raise ValueError("测试数据缺少 `Close` 列，无法计算买入并持有曲线。")
-
-    close_series = df_prepared["Close"].astype(float)
-    buy_and_hold = initial_cash * (close_series / close_series.iloc[0])
-    buy_and_hold.name = "买入并持有"
-
-    metrics_buy_hold = {
-        "Total Return": buy_and_hold.iloc[-1] / initial_cash - 1.0,
-        "Final Equity": buy_and_hold.iloc[-1],
+    strategies = {
+        "PPO 动态策略": ppo_result,
+        "智行均线策略": zhixing_result,
+        "定投策略": dca_result,
     }
 
-    equity_curves = {
-        "PPO 动态策略": ppo_result.equity_curve,
-        "智行均线策略": zhixing_result.equity_curve,
-        "买入并持有": buy_and_hold,
-    }
+    if "Close" in df_prepared.columns:
+        close_series = df_prepared["Close"].astype(float)
+        if not close_series.empty:
+            buy_and_hold = initial_cash * (close_series / close_series.iloc[0])
+            buy_and_hold.name = "买入并持有"
+            strategies["买入并持有"] = {
+                "equity_curve": buy_and_hold,
+                "metrics": {
+                    "总回报率": float(buy_and_hold.iloc[-1] / initial_cash - 1.0),
+                    "最终净值": float(buy_and_hold.iloc[-1]),
+                },
+                "trades_df": pd.DataFrame(),
+                "actions_df": pd.DataFrame(),
+                "raw": {},
+            }
 
-    metrics_combined = {
-        "PPO 动态策略": ppo_result.metrics,
-        "智行均线策略": zhixing_result.metrics,
-        "买入并持有": metrics_buy_hold,
-    }
+    summary = {name: data.get("metrics", {}) for name, data in strategies.items()}
 
     return {
-        "equity_curves": equity_curves,
-        "metrics": metrics_combined,
-        "details": {
-            "ppo": ppo_result.extra,
-            "baseline": zhixing_result.extra,
+        "strategies": strategies,
+        "summary": summary,
+        "meta": {
+            "initial_cash": initial_cash,
+            "monthly_investment": monthly_investment,
+            "fee": fee,
         },
     }
 

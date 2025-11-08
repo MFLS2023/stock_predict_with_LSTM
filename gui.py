@@ -209,7 +209,7 @@ class AiBacktestThread(QThread):
                 model_path=str(self.model_path),
                 df_test=self.df_test,
                 initial_cash=self.initial_cash,
-                monthly_invest=self.monthly_invest,
+                monthly_investment=self.monthly_invest,
                 fee=self.fee,
             )
             self.succeeded.emit(result)
@@ -1067,6 +1067,11 @@ class MainWindow(QMainWindow):
         self.export_backtest_button.setEnabled(False)
         layout.addWidget(self.export_backtest_button)
 
+        self.export_trades_button = QPushButton("导出PPO交易(Excel)")
+        self.export_trades_button.clicked.connect(self.export_ppo_trades)
+        self.export_trades_button.setEnabled(False)
+        layout.addWidget(self.export_trades_button)
+
         # === AI 动态策略 ===
         ai_group = QGroupBox("AI 动态策略对比 (Reinforcement Learning)")
         ai_form = QFormLayout(ai_group)
@@ -1620,6 +1625,8 @@ class MainWindow(QMainWindow):
         self.append_log(f"测试数据准备完成: {len(df_test)} 条记录 ({test_start.date()} 到 {test_end.date()})")
 
         self.ai_comparison_result = None
+        if hasattr(self, "export_trades_button"):
+            self.export_trades_button.setEnabled(False)
 
         initial_cash = float(self.ai_initial_cash_spin.value())
         monthly_invest = float(self.ai_monthly_spin.value())
@@ -1650,26 +1657,41 @@ class MainWindow(QMainWindow):
         self.status_label.setText("对比回测完成")
         self.ai_last_result = results
         self.ai_comparison_result = results
+        self._last_backtest_result = results
+
+        strategies = results.get("strategies", {})
+        summary = results.get("summary", {})
 
         self.append_log("=== 策略对比回测完成 ===")
-        equity_curves = results.get("equity_curves")
-        if equity_curves:
-            self.append_log(f"获取到 {len(equity_curves)} 条净值曲线：{', '.join(equity_curves.keys())}")
+        if strategies:
+            self.append_log(f"获取到 {len(strategies)} 个策略结果：{', '.join(strategies.keys())}")
         else:
-            self.append_log("警告：回测结果中未包含净值曲线。")
+            self.append_log("警告：回测结果中未找到任何策略数据。")
 
-        metrics = results.get("metrics")
-        if metrics:
-            self.append_log(f"可用指标集合：{', '.join(metrics.keys())}")
+        if summary:
+            for name, metrics in summary.items():
+                total_return = metrics.get("总回报率")
+                max_drawdown = metrics.get("最大回撤")
+                sharpe = metrics.get("夏普比率")
+                self.append_log(
+                    f"{name}: 总回报 {total_return:.2%} | 最大回撤 {max_drawdown:.2%} | 夏普 {sharpe:.2f}"
+                    if isinstance(total_return, (int, float)) and isinstance(max_drawdown, (int, float)) and isinstance(sharpe, (int, float))
+                    else f"{name}: 指标 {metrics}"
+                )
         else:
-            self.append_log("警告：回测结果中未包含指标数据。")
+            self.append_log("警告：回测结果中未包含指标汇总。")
 
         self.ai_progress.setRange(0, 1)
         self.ai_progress.setValue(1)
         self.ai_progress.setFormat("回测完成")
 
+        ppo_trades_df = strategies.get("PPO 动态策略", {}).get("trades_df")
+        enable_trades_export = isinstance(ppo_trades_df, pd.DataFrame) and not ppo_trades_df.empty
+        if hasattr(self, "export_trades_button"):
+            self.export_trades_button.setEnabled(enable_trades_export)
+
         try:
-            self._display_comparison_result(results)
+            self._display_comparison_result(strategies)
         except Exception as exc:
             self.append_log(f"显示回测结果时出错: {exc}")
             self.append_log(traceback.format_exc())
@@ -1685,42 +1707,80 @@ class MainWindow(QMainWindow):
         self.ai_progress.setValue(0)
         self.ai_progress.setFormat("回测失败")
 
-    def _display_comparison_result(self, results: Dict[str, Any]) -> None:
-        equity_curves = results.get("equity_curves") or {}
-        if not equity_curves:
-            raise ValueError("缺少净值曲线数据，无法绘制比较图。")
-        
-        fig = Figure(figsize=(10, 6))
-        ax = fig.add_subplot(111)
-        color_cycle = ['#d62728', '#2ca02c', '#1f77b4', '#9467bd', '#ff7f0e']
+    def _display_comparison_result(self, strategies: Dict[str, Any]) -> None:
+        if not strategies:
+            raise ValueError("缺少策略数据，无法绘制比较图。")
 
-        for idx, (name, curve) in enumerate(equity_curves.items()):
+        self._clear_kline_canvas()
+
+        fig, axes = plt.subplots(
+            nrows=3,
+            ncols=1,
+            sharex=True,
+            figsize=(12, 10),
+            gridspec_kw={'height_ratios': [3, 1, 2]},
+        )
+        fig.tight_layout(pad=4.0)
+
+        color_cycle = plt.rcParams['axes.prop_cycle'].by_key().get('color', ['#1f77b4', '#ff7f0e', '#2ca02c'])
+
+        # --- 子图1: 净值曲线 ---
+        for idx, (name, payload) in enumerate(strategies.items()):
+            curve = payload.get('equity_curve')
             if curve is None:
                 continue
             if isinstance(curve, pd.DataFrame):
-                for col in curve.columns:
-                    series = curve[col].astype(float)
-                    ax.plot(series.index, series.values, label=f"{name}-{col}", color=color_cycle[idx % len(color_cycle)])
+                series = curve.iloc[:, 0].astype(float)
             else:
-                series = pd.Series(curve)
-                series = series.astype(float)
-                if not isinstance(series.index, pd.DatetimeIndex):
-                    series.index = pd.RangeIndex(start=0, stop=len(series))
-                ax.plot(series.index, series.values, label=name, color=color_cycle[idx % len(color_cycle)])
+                series = pd.Series(curve, copy=False).astype(float)
+            if not isinstance(series.index, pd.DatetimeIndex):
+                series.index = pd.RangeIndex(start=0, stop=len(series))
+            axes[0].plot(series.index, series.values, label=name, color=color_cycle[idx % len(color_cycle)], linewidth=1.6)
 
-        if getattr(self, '_chinese_font_prop', None) is not None:
-            ax.set_title('AI 动态策略 vs 基准策略 净值对比', fontweight='bold', fontproperties=self._chinese_font_prop)
-            ax.set_ylabel('资产净值 (元)', fontproperties=self._chinese_font_prop)
-            ax.legend(loc='upper left', title='策略', prop=self._chinese_font_prop, title_fontproperties=self._chinese_font_prop)
+            drawdown = (series / series.cummax()) - 1.0
+            axes[1].plot(drawdown.index, drawdown.values, label=name, color=color_cycle[idx % len(color_cycle)], alpha=0.9)
+
+        axes[0].set_title("策略净值对比", fontproperties=getattr(self, '_chinese_font_prop', None))
+        axes[0].set_ylabel("资产净值 (元)", fontproperties=getattr(self, '_chinese_font_prop', None))
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend(loc='upper left')
+
+        axes[1].set_title("最大回撤对比", fontproperties=getattr(self, '_chinese_font_prop', None))
+        axes[1].set_ylabel("回撤", fontproperties=getattr(self, '_chinese_font_prop', None))
+        axes[1].grid(True, alpha=0.3)
+        axes[1].yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
+
+        # --- 子图3: PPO 行为 ---
+        axes[2].set_title("PPO 策略行为")
+        axes[2].set_xlabel("日期")
+        axes[2].set_ylabel("仓位比例", color='tab:blue')
+        axes[2].set_ylim(0, 1.05)
+        axes[2].grid(True, alpha=0.3)
+
+        ppo_payload = strategies.get('PPO 动态策略', {})
+        actions_df = ppo_payload.get('actions_df')
+        twin_ax = None
+        if isinstance(actions_df, pd.DataFrame) and not actions_df.empty:
+            if '仓位比例' in actions_df.columns:
+                axes[2].plot(actions_df.index, actions_df['仓位比例'], label='PPO 仓位比例', color='tab:blue')
+            else:
+                axes[2].plot(actions_df.index, actions_df.iloc[:, -1], label='PPO 行为', color='tab:blue')
+
+            if '网格间距' in actions_df.columns:
+                twin_ax = axes[2].twinx()
+                twin_ax.plot(actions_df.index, actions_df['网格间距'], label='网格间距', color='tab:orange', alpha=0.6)
+                twin_ax.set_ylabel('网格间距', color='tab:orange')
+                twin_ax.tick_params(axis='y', labelcolor='tab:orange')
+
+            lines, labels = axes[2].get_legend_handles_labels()
+            if twin_ax is not None:
+                lines2, labels2 = twin_ax.get_legend_handles_labels()
+                axes[2].legend(lines + lines2, labels + labels2, loc='upper right')
+            else:
+                axes[2].legend(loc='upper right')
         else:
-            ax.set_title('AI 动态策略 vs 基准策略 净值对比', fontweight='bold')
-            ax.set_ylabel('资产净值 (元)')
-            ax.legend(loc='upper left', title='策略')
-        ax.yaxis.set_major_formatter(mticker.StrMethodFormatter('{x:,.0f}'))
-        ax.grid(True, linestyle='--', alpha=0.3)
-        fig.autofmt_xdate()
+            axes[2].text(0.5, 0.5, "暂无 PPO 行为数据", transform=axes[2].transAxes, ha='center', va='center', color='gray')
 
-        self._clear_kline_canvas()
         canvas = FigureCanvas(fig)
         toolbar = NavigationToolbar(canvas, self.kline_widget)
         self.kline_layout.addWidget(canvas)
@@ -1732,33 +1792,63 @@ class MainWindow(QMainWindow):
         self._kline_mpl_cids = []
         canvas.draw_idle()
 
-        self._last_backtest_result = results
         self.export_backtest_button.setEnabled(True)
         self.tabs.setCurrentIndex(0)
 
-        metrics_combined = results.get('metrics', {}) or {}
-
-        def format_currency(val: Any) -> str:
-            return f"{float(val):,.2f}" if isinstance(val, (float, int)) and pd.notna(val) else "--"
-
         def format_pct(val: Any) -> str:
-            return f"{val * 100:.2f}%" if isinstance(val, (float, int)) and pd.notna(val) else "--"
+            return f"{val:.2%}" if isinstance(val, (int, float)) and pd.notna(val) else "--"
 
-        summary_lines: list[str] = ["净值/收益概览："]
-        for name, metric in metrics_combined.items():
-            if not metric:
-                continue
-            parts = [name]
-            if "Final Equity" in metric:
-                parts.append(f"最终净值 {format_currency(metric['Final Equity'])}")
-            if "Total Return" in metric:
-                parts.append(f"总收益 {format_pct(metric['Total Return'])}")
-            summary_lines.append(" | ".join(parts))
+        def format_number(val: Any) -> str:
+            return f"{val:,.2f}" if isinstance(val, (int, float)) and pd.notna(val) else "--"
 
-        if len(summary_lines) == 1:
-            summary_lines = ["暂未获取到指标数据"]
+        info_lines: list[str] = []
+        for name, payload in strategies.items():
+            metrics = payload.get('metrics', {}) or {}
+            info_lines.append(f"--- {name} ---")
+            info_lines.append(f"  总回报: {format_pct(metrics.get('总回报率'))}")
+            info_lines.append(f"  最大回撤: {format_pct(metrics.get('最大回撤'))}")
+            if '夏普比率' in metrics:
+                info_lines.append(f"  夏普比率: {format_number(metrics.get('夏普比率'))}")
+            if '胜率' in metrics:
+                info_lines.append(f"  胜率: {format_pct(metrics.get('胜率'))}")
+            if '总交易次数' in metrics:
+                info_lines.append(f"  交易次数: {metrics.get('总交易次数', '--')}")
+            if '最终净值' in metrics:
+                info_lines.append(f"  最终净值: {format_number(metrics.get('最终净值'))}")
+            info_lines.append("")
 
-        self.chart_info_label.setText('\n'.join(summary_lines))
+        self.chart_info_label.setText("\n".join(info_lines).strip())
+
+    def export_ppo_trades(self) -> None:
+        if not self.ai_last_result:
+            QMessageBox.information(self, "暂无数据", "请先运行一次策略对比回测。")
+            return
+
+        strategies = self.ai_last_result.get("strategies", {}) if isinstance(self.ai_last_result, dict) else {}
+        ppo_payload = strategies.get("PPO 动态策略", {})
+        trades_df = ppo_payload.get("trades_df")
+
+        if not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
+            QMessageBox.information(self, "无交易记录", "当前回测未生成可导出的 PPO 交易记录。")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存PPO交易记录",
+            os.path.join(os.getcwd(), "ppo_trades.xlsx"),
+            "Excel 文件 (*.xlsx)",
+        )
+
+        if not path:
+            return
+
+        try:
+            trades_df.to_excel(path, index=False)
+            self.append_log(f"PPO 交易记录已导出至 {path}")
+            QMessageBox.information(self, "导出成功", f"PPO 交易记录已保存至:\n{path}")
+        except Exception as exc:  # noqa: BLE001
+            self.append_log(f"导出 PPO 交易记录失败: {exc}\n{traceback.format_exc()}")
+            QMessageBox.critical(self, "导出失败", f"导出交易记录时出错: {exc}")
 
     def _clear_kline_canvas(self, keep_placeholder: bool = False) -> None:
         # 断开旧的 matplotlib 事件连接
@@ -2091,26 +2181,26 @@ class MainWindow(QMainWindow):
             return
 
         # 对比回测导出：自定义 HTML
-        if isinstance(export_data, dict) and "equity_curves" in export_data:
+        if isinstance(export_data, dict) and "strategies" in export_data:
             try:
-                equity_curves = export_data.get("equity_curves", {}) or {}
-                metrics = export_data.get("metrics", {}) or {}
+                strategies = export_data.get("strategies", {}) or {}
+                summary = export_data.get("summary", {}) or {}
 
-                curve_map: Dict[str, pd.Series] = {}
-                for name, curve in equity_curves.items():
-                    if curve is None:
-                        continue
-                    if isinstance(curve, pd.DataFrame):
-                        for col in curve.columns:
-                            curve_map[f"{name}-{col}"] = pd.Series(curve[col]).astype(float)
-                    else:
-                        curve_map[name] = pd.Series(curve).astype(float)
+                equity_columns: Dict[str, pd.Series] = {}
+                for name, payload in strategies.items():
+                    curve = payload.get("equity_curve") if isinstance(payload, dict) else None
+                    if isinstance(curve, pd.Series):
+                        equity_columns[name] = curve.astype(float)
+                    elif isinstance(curve, pd.DataFrame) and not curve.empty:
+                        equity_columns[name] = curve.iloc[:, 0].astype(float)
 
-                equity_df = pd.DataFrame(curve_map)
-                equity_df.index.name = "Index"
+                equity_df = pd.DataFrame(equity_columns)
+                if not equity_df.empty:
+                    equity_df.index.name = "日期"
 
                 metrics_rows = []
-                for strategy, metric in metrics.items():
+                metrics_source = summary if summary else {name: payload.get("metrics", {}) for name, payload in strategies.items()}
+                for strategy, metric in metrics_source.items():
                     row = {"策略": strategy}
                     for key, value in (metric or {}).items():
                         if isinstance(value, (float, int)):
@@ -2119,6 +2209,8 @@ class MainWindow(QMainWindow):
                             row[key] = value
                     metrics_rows.append(row)
                 metrics_df = pd.DataFrame(metrics_rows)
+
+                ppo_trades_df = strategies.get("PPO 动态策略", {}).get("trades_df")
 
                 html_parts = [
                     "<html><head><meta charset='utf-8'><title>策略对比回测报告</title>",
@@ -2139,6 +2231,10 @@ class MainWindow(QMainWindow):
                     html_parts.append(equity_df.to_html())
                 else:
                     html_parts.append("<p>暂无净值曲线数据。</p>")
+
+                if isinstance(ppo_trades_df, pd.DataFrame) and not ppo_trades_df.empty:
+                    html_parts.append("<h2>PPO 交易明细 (前100条)</h2>")
+                    html_parts.append(ppo_trades_df.head(100).to_html(index=False))
 
                 html_parts.append("</body></html>")
 

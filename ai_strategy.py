@@ -181,6 +181,9 @@ class DynamicGridEnv(gym.Env):
         self.nav_history: List[float] = []
         self.nav_index: List[Any] = []
         self._last_invest_month: Optional[Tuple[int, int]] = None
+        self.current_date: Any = self._index_value(self.current_step)
+        self._last_action: np.ndarray = np.zeros(self.action_space.shape, dtype=np.float32)
+        self._position_cost: float = 0.0
 
         self.reset()
 
@@ -198,6 +201,9 @@ class DynamicGridEnv(gym.Env):
         self._last_invest_month = None
         self.nav_history = []
         self.nav_index = []
+        self.current_date = self._index_value(self.current_step)
+        self._last_action = np.zeros(self.action_space.shape, dtype=np.float32)
+        self._position_cost = 0.0
         self._record_nav()
         return self._get_obs(), self._get_info()
 
@@ -225,6 +231,7 @@ class DynamicGridEnv(gym.Env):
             "step": self.current_step,
             "type": "deposit",
             "amount": self.monthly_invest,
+            "timestamp": self._index_value(self.current_step),
         })
         return self.monthly_invest
 
@@ -264,16 +271,24 @@ class DynamicGridEnv(gym.Env):
             "cash": float(self.cash),
             "holding_shares": float(self.holding_shares),
             "cash_added": float(self.cash_added),
+            "current_date": self._index_value(self.current_step),
+            "trades": [],
+            "last_action": self._last_action.tolist(),
         }
 
     def step(self, action: Sequence[float]):
         if self.current_step >= len(self.df) - 1:
-            return self._get_obs(), 0.0, True, False, self._get_info()
+            info_terminal = self._get_info()
+            info_terminal["trades"] = []
+            return self._get_obs(), 0.0, True, False, info_terminal
 
-        action = np.clip(np.asarray(action, dtype=np.float32), self.action_space.low, self.action_space.high)
-        position_size = float(action[2])
+        action_array = np.clip(np.asarray(action, dtype=np.float32), self.action_space.low, self.action_space.high)
+        self._last_action = action_array.copy()
+        position_size = float(action_array[2])
         current_row = self.df.iloc[self.current_step]
         current_price = float(current_row["Close"])
+        self.current_date = self._index_value(self.current_step)
+        trades_this_step: List[Dict[str, Any]] = []
         deposit = self._apply_monthly_investment()
         prev_value = max(self.portfolio_value, 1e-8)
 
@@ -289,18 +304,33 @@ class DynamicGridEnv(gym.Env):
             amount_to_buy = min(max(amount_needed, 0.0), max_affordable)
             if amount_to_buy > 0:
                 shares_to_buy = amount_to_buy / current_price
-                cost = amount_to_buy * (1 + self.fee)
+                commission_paid = amount_to_buy * self.fee
+                total_cost = amount_to_buy * (1 + self.fee)
                 self.holding_shares += shares_to_buy
-                self.cash -= cost
+                self.cash -= total_cost
                 self.last_trade_price = current_price
-                self.total_commission += amount_to_buy * self.fee
-                self.trades.append(
+                self.total_commission += commission_paid
+                self._position_cost += total_cost
+                trade_entry = {
+                    "step": self.current_step,
+                    "type": "buy",
+                    "shares": float(shares_to_buy),
+                    "price": current_price,
+                    "value": float(amount_to_buy),
+                    "timestamp": self.current_date,
+                    "commission": float(commission_paid),
+                    "profit": float(-total_cost),
+                }
+                self.trades.append(trade_entry)
+                trades_this_step.append(
                     {
-                        "step": self.current_step,
-                        "type": "buy",
-                        "shares": float(shares_to_buy),
-                        "price": current_price,
-                        "value": float(amount_to_buy),
+                        "时间": self.current_date,
+                        "方向": "买入",
+                        "价格": current_price,
+                        "数量": float(shares_to_buy),
+                        "金额": -float(total_cost),
+                        "手续费": float(commission_paid),
+                        "盈亏": 0.0,
                     }
                 )
         elif target_value + 1e-8 < current_value and self.holding_shares > 0:
@@ -308,16 +338,36 @@ class DynamicGridEnv(gym.Env):
             shares_to_sell = min(self.holding_shares, amount_to_release / current_price)
             if shares_to_sell > 0:
                 proceeds = shares_to_sell * current_price
+                commission_paid = proceeds * self.fee
+                holding_before = max(self.holding_shares, 1e-8)
+                ratio = float(shares_to_sell) / holding_before
+                cost_released = self._position_cost * ratio
+                net_proceeds = proceeds * (1 - self.fee)
                 self.holding_shares -= shares_to_sell
-                self.cash += proceeds * (1 - self.fee)
-                self.total_commission += proceeds * self.fee
-                self.trades.append(
+                self.cash += net_proceeds
+                self.total_commission += commission_paid
+                self._position_cost = max(self._position_cost - cost_released, 0.0)
+                profit = net_proceeds - cost_released
+                trade_entry = {
+                    "step": self.current_step,
+                    "type": "sell",
+                    "shares": float(shares_to_sell),
+                    "price": current_price,
+                    "value": float(proceeds),
+                    "timestamp": self.current_date,
+                    "commission": float(commission_paid),
+                    "profit": float(profit),
+                }
+                self.trades.append(trade_entry)
+                trades_this_step.append(
                     {
-                        "step": self.current_step,
-                        "type": "sell",
-                        "shares": float(shares_to_sell),
-                        "price": current_price,
-                        "value": float(proceeds),
+                        "时间": self.current_date,
+                        "方向": "卖出",
+                        "价格": current_price,
+                        "数量": float(shares_to_sell),
+                        "金额": float(net_proceeds),
+                        "手续费": float(commission_paid),
+                        "盈亏": float(profit),
                     }
                 )
 
@@ -334,7 +384,10 @@ class DynamicGridEnv(gym.Env):
         truncated = self.current_step >= len(self.df) - 1
 
         self._record_nav()
-        return self._get_obs(), float(reward), terminated, truncated, self._get_info()
+        info = self._get_info()
+        info["trades"] = trades_this_step
+        info["last_action"] = action_array.tolist()
+        return self._get_obs(), float(reward), terminated, truncated, info
 
     def get_nav_series(self) -> pd.Series:
         index = self.nav_index
