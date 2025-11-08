@@ -162,6 +162,8 @@ class DynamicGridEnv(gym.Env):
         self.fee = float(fee)
         self.monthly_invest = float(monthly_invest)
         self.min_commission: float = 5.0
+        self.profit_bonus_coef: float = 0.5
+        self.trade_penalty: float = 0.0005
 
         self.action_space = spaces.Box(
             low=np.array([0.005, 0.01, 0.10], dtype=np.float32),
@@ -373,10 +375,22 @@ class DynamicGridEnv(gym.Env):
                 )
 
         self.portfolio_value = self.cash + self.holding_shares * current_price
-        reward = (self.portfolio_value - prev_value - deposit) / max(prev_value, 1.0)
 
-        if self.trades and self.trades[-1].get("type") in {"buy", "sell"}:
-            reward -= 0.0005
+        base_reward = (self.portfolio_value - prev_value - deposit) / max(prev_value, 1.0)
+
+        profit_bonus = 0.0
+        if trades_this_step:
+            positive_profit = sum(
+                float(trade.get("盈亏", 0.0))
+                for trade in trades_this_step
+                if str(trade.get("方向")) == "卖出" and float(trade.get("盈亏", 0.0)) > 0.0
+            )
+            if positive_profit > 0.0:
+                profit_bonus = (positive_profit / max(self.portfolio_value, 1.0)) * self.profit_bonus_coef
+
+        trade_penalty = self.trade_penalty if trades_this_step else 0.0
+
+        reward = base_reward + profit_bonus - trade_penalty
 
         self.total_reward += reward
 
