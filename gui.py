@@ -1274,7 +1274,7 @@ class MainWindow(QMainWindow):
         self.ai_total_timesteps_spin = QSpinBox()
         self.ai_total_timesteps_spin.setRange(100, 10_000_000)
         self.ai_total_timesteps_spin.setSingleStep(1000)
-        self.ai_total_timesteps_spin.setValue(200000)
+        self.ai_total_timesteps_spin.setValue(5_000_000)
         self.ai_total_timesteps_spin.setToolTip("设置总训练步数，此参数是训练时长的主要决定因素。")
         self._prepare_spinbox(self.ai_total_timesteps_spin, "例如: 2500 用于快速测试")
 
