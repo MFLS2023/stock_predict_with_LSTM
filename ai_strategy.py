@@ -199,7 +199,8 @@ class DynamicGridEnv(gym.Env):
             high=np.array([0.05, 0.10, 1.0], dtype=np.float32),
             dtype=np.float32,
         )
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32)
+        obs_dim = len(self.feature_columns) + 4  # 特征 + 账户状态
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
         self.current_step: int = 0
         self.cash: float = self.initial_cash
@@ -315,6 +316,21 @@ class DynamicGridEnv(gym.Env):
             "last_action": self._last_action.tolist(),
         }
 
+    def _calculate_reward_v2(
+        self,
+        ai_return: float,
+        dca_return: float,
+        cost_this_step: float,
+        last_portfolio_value: float,
+    ) -> float:
+        """基于超额收益的奖励函数 (V2)。"""
+
+        excess_return = ai_return - dca_return
+        transaction_penalty = cost_this_step / max(last_portfolio_value, 1.0)
+        reward_scaling_factor = 100.0
+        reward = excess_return * reward_scaling_factor - transaction_penalty
+        return float(reward)
+
     def step(self, action: Sequence[float]):
         if self.current_step >= len(self.df) - 1:
             info_terminal = self._get_info()
@@ -330,6 +346,7 @@ class DynamicGridEnv(gym.Env):
         trades_this_step: List[Dict[str, Any]] = []
         deposit = self._apply_monthly_investment()
         prev_value = max(self.portfolio_value, 1e-8)
+        cost_this_step = 0.0
 
         target_value = self.portfolio_value * position_size
         current_value = self.holding_shares * current_price
@@ -349,6 +366,7 @@ class DynamicGridEnv(gym.Env):
                 self.cash -= total_cost
                 self.last_trade_price = current_price
                 self.total_commission += commission_paid
+                cost_this_step += commission_paid
                 self._position_cost += total_cost
                 trade_entry = {
                     "step": self.current_step,
@@ -385,6 +403,7 @@ class DynamicGridEnv(gym.Env):
                 self.holding_shares -= shares_to_sell
                 self.cash += net_proceeds
                 self.total_commission += commission_paid
+                cost_this_step += commission_paid
                 self._position_cost = max(self._position_cost - cost_released, 0.0)
                 profit = net_proceeds - cost_released
                 trade_entry = {
@@ -426,21 +445,12 @@ class DynamicGridEnv(gym.Env):
         dca_deposit = max(dca_next_invested - dca_prev_invested, 0.0)
         dca_return = (dca_next_value - dca_prev_value - dca_deposit) / max(dca_prev_value, 1.0)
 
-        base_reward = ai_return - dca_return
-
-        profit_bonus = 0.0
-        if trades_this_step:
-            positive_profit = sum(
-                float(trade.get("盈亏", 0.0))
-                for trade in trades_this_step
-                if str(trade.get("方向")) == "卖出" and float(trade.get("盈亏", 0.0)) > 0.0
-            )
-            if positive_profit > 0.0:
-                profit_bonus = (positive_profit / max(self.portfolio_value, 1.0)) * self.profit_bonus_coef
-
-        trade_penalty = self.trade_penalty if trades_this_step else 0.0
-
-        reward = base_reward + profit_bonus - trade_penalty
+        reward = self._calculate_reward_v2(
+            ai_return=ai_return,
+            dca_return=dca_return,
+            cost_this_step=cost_this_step,
+            last_portfolio_value=prev_value,
+        )
 
         self.total_reward += reward
 
