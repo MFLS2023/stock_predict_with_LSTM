@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import pickle
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ import numpy as np
 import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
+from sklearn.preprocessing import StandardScaler
 
 try:  # pragma: no cover - optional dependency for RL
     from stable_baselines3 import PPO
@@ -51,11 +53,20 @@ _COLUMN_ALIASES: Dict[str, str] = {
     "price": "Close",
     "volume": "Volume",
     "vol": "Volume",
-    "成交量": "Volume",
     "amount": "Amount",
     "成交额": "Amount",
     "turnover": "Amount",
 }
+
+FEATURE_COLUMNS: Tuple[str, ...] = (
+    "returns",
+    "ma_5",
+    "ma_10",
+    "ma_20",
+    "volatility_10",
+    "momentum_10",
+    "rsi",
+)
 
 
 def _log(logger: Optional[logging.Logger], message: str) -> None:
@@ -138,8 +149,9 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     rs = gain / (loss.replace(0.0, np.nan))
     working["rsi"] = 100 - (100 / (1 + rs.replace([np.inf, -np.inf], np.nan)))
 
-    working.replace([np.inf, -np.inf], 0.0, inplace=True)
-    working.fillna(0.0, inplace=True)
+    working.replace([np.inf, -np.inf], np.nan, inplace=True)
+    working.ffill(inplace=True)
+    working.dropna(subset=list(FEATURE_COLUMNS), inplace=True)
     return working
 
 
@@ -154,6 +166,8 @@ class DynamicGridEnv(gym.Env):
         initial_cash: float = 100_000.0,
         fee: float = 0.001,
         monthly_invest: float = 0.0,
+        feature_scaler: Optional[StandardScaler] = None,
+        fit_feature_scaler: bool = True,
     ) -> None:
         super().__init__()
 
@@ -161,6 +175,21 @@ class DynamicGridEnv(gym.Env):
         self.initial_cash = float(initial_cash)
         self.fee = float(fee)
         self.monthly_invest = float(monthly_invest)
+        self.feature_columns: Tuple[str, ...] = FEATURE_COLUMNS
+        if feature_scaler is None:
+            if not fit_feature_scaler:
+                raise ValueError(
+                    "feature_scaler must be provided when fit_feature_scaler is False to avoid refitting on evaluation data."
+                )
+            fitted_scaler = StandardScaler()
+            fitted_scaler.fit(self.df[list(self.feature_columns)])
+            self.feature_scaler: Optional[StandardScaler] = fitted_scaler
+        else:
+            self.feature_scaler = feature_scaler
+        if self.feature_scaler is not None:
+            transformed_features = self.feature_scaler.transform(self.df[list(self.feature_columns)])
+            self.df.loc[:, self.feature_columns] = transformed_features
+
         self.min_commission: float = 5.0
         self.profit_bonus_coef: float = 0.5
         self.trade_penalty: float = 0.0005
@@ -187,6 +216,13 @@ class DynamicGridEnv(gym.Env):
         self.current_date: Any = self._index_value(self.current_step)
         self._last_action: np.ndarray = np.zeros(self.action_space.shape, dtype=np.float32)
         self._position_cost: float = 0.0
+
+        self._dca_nav_series, self._dca_invested_series = _simulate_dca(
+            self.df,
+            initial_cash=self.initial_cash,
+            monthly_invest=self.monthly_invest,
+            fee=self.fee,
+        )
 
         self.reset()
 
@@ -243,11 +279,11 @@ class DynamicGridEnv(gym.Env):
             return np.zeros(self.observation_space.shape, dtype=np.float32)
 
         row = self.df.iloc[self.current_step]
-        market_features = row[["ma_5", "ma_10", "ma_20", "volatility_10", "momentum_10", "rsi"]]
-        market_features = market_features.astype(float)
-        mean = market_features.mean()
-        std = market_features.std()
-        market_features = (market_features - mean) / (std + 1e-8)
+        feature_array = row[list(self.feature_columns)].astype(float).to_numpy().reshape(1, -1)
+        if self.feature_scaler is not None:
+            market_features = self.feature_scaler.transform(feature_array)[0]
+        else:
+            market_features = feature_array[0]
         market_features = np.nan_to_num(market_features, nan=0.0)
         market_features = np.asarray(market_features, dtype=np.float32)
 
@@ -376,7 +412,21 @@ class DynamicGridEnv(gym.Env):
 
         self.portfolio_value = self.cash + self.holding_shares * current_price
 
-        base_reward = (self.portfolio_value - prev_value - deposit) / max(prev_value, 1.0)
+        ai_return = (self.portfolio_value - prev_value - deposit) / max(prev_value, 1.0)
+
+        dca_prev_value = float(self._dca_nav_series.iloc[self.current_step])
+        dca_prev_invested = float(self._dca_invested_series.iloc[self.current_step])
+        if self.current_step + 1 < len(self._dca_nav_series):
+            dca_next_value = float(self._dca_nav_series.iloc[self.current_step + 1])
+            dca_next_invested = float(self._dca_invested_series.iloc[self.current_step + 1])
+        else:
+            dca_next_value = dca_prev_value
+            dca_next_invested = dca_prev_invested
+
+        dca_deposit = max(dca_next_invested - dca_prev_invested, 0.0)
+        dca_return = (dca_next_value - dca_prev_value - dca_deposit) / max(dca_prev_value, 1.0)
+
+        base_reward = ai_return - dca_return
 
         profit_bonus = 0.0
         if trades_this_step:
@@ -478,6 +528,7 @@ class TrainingArtifact:
     monthly_cash: float
     fee: float
     device_preference: str
+    feature_scaler_path: Optional[str] = None
     best_epoch: Optional[int] = None
     best_metrics: Dict[str, Any] = field(default_factory=dict)
     training_history: List[Dict[str, Any]] = field(default_factory=list)
@@ -494,6 +545,7 @@ class TrainingArtifact:
             "monthly_cash": self.monthly_cash,
             "fee": self.fee,
             "device_preference": self.device_preference,
+            "feature_scaler_path": self.feature_scaler_path,
             "best_epoch": self.best_epoch,
             "best_metrics": self.best_metrics,
             "training_history": self.training_history,
@@ -512,6 +564,7 @@ class TrainingArtifact:
             monthly_cash=data.get("monthly_cash", 0.0),
             fee=data.get("fee", 0.0),
             device_preference=data.get("device_preference", "auto"),
+            feature_scaler_path=data.get("feature_scaler_path"),
             best_epoch=data.get("best_epoch"),
             best_metrics=data.get("best_metrics", {}),
             training_history=data.get("training_history", []),
@@ -554,8 +607,17 @@ def _run_single_episode(
     initial_cash: float,
     fee: float,
     monthly_cash: float,
+    feature_scaler: Optional[StandardScaler] = None,
 ) -> Tuple[Dict[str, Any], pd.Series]:
-    env = DynamicGridEnv(df=df, initial_cash=initial_cash, fee=fee, monthly_invest=monthly_cash)
+    fit_scaler = feature_scaler is None
+    env = DynamicGridEnv(
+        df=df,
+        initial_cash=initial_cash,
+        fee=fee,
+        monthly_invest=monthly_cash,
+        feature_scaler=feature_scaler,
+        fit_feature_scaler=fit_scaler,
+    )
     obs, _ = env.reset()
     total_reward = 0.0
     while True:
@@ -580,11 +642,19 @@ def _evaluate_policy(
     fee: float,
     monthly_cash: float,
     episodes: int,
+    feature_scaler: Optional[StandardScaler] = None,
 ) -> Dict[str, Any]:
     episode_metrics: List[Dict[str, Any]] = []
     history_series: Optional[pd.Series] = None
     for _ in range(max(1, episodes)):
-        metrics, nav_series = _run_single_episode(model, df, initial_cash, fee, monthly_cash)
+        metrics, nav_series = _run_single_episode(
+            model,
+            df,
+            initial_cash,
+            fee,
+            monthly_cash,
+            feature_scaler=feature_scaler,
+        )
         episode_metrics.append(metrics)
         if history_series is None:
             history_series = nav_series
@@ -680,6 +750,13 @@ def train_ai_strategy(
         vec_env.seed(config.seed)  # type: ignore[attr-defined]
         vec_env.reset()
 
+    train_feature_scaler: Optional[StandardScaler] = None
+    try:
+        primary_env = vec_env.envs[0]
+        train_feature_scaler = getattr(primary_env, "feature_scaler", None)
+    except Exception:
+        train_feature_scaler = None
+
     policy_kwargs = dict(net_arch=dict(pi=[128, 128], vf=[128, 128]))
     model = PPO(
         "MlpPolicy",
@@ -724,6 +801,7 @@ def train_ai_strategy(
             fee=config.fee,
             monthly_cash=config.monthly_cash,
             episodes=config.eval_episodes,
+            feature_scaler=train_feature_scaler,
         )
 
         history_entry = {
@@ -772,6 +850,16 @@ def train_ai_strategy(
 
     vec_env.close()
 
+    scaler_path: Optional[Path] = None
+    if train_feature_scaler is not None:
+        scaler_path = output_dir / "feature_scaler.pkl"
+        try:
+            with scaler_path.open("wb") as fh:
+                pickle.dump(train_feature_scaler, fh)
+        except Exception as exc:
+            _log(logger, f"保存特征标准化器失败: {exc}")
+            scaler_path = None
+
     _save_json(config_path, config.to_dict())
     artifact = TrainingArtifact(
         framework=framework,
@@ -783,6 +871,7 @@ def train_ai_strategy(
         monthly_cash=config.monthly_cash,
         fee=config.fee,
         device_preference=config.device_preference,
+        feature_scaler_path=str(scaler_path) if scaler_path is not None else None,
         best_epoch=best_epoch,
         best_metrics=best_metrics or {},
         training_history=history,
@@ -800,15 +889,27 @@ def load_artifact(path: Path | str) -> TrainingArtifact:
     artifact = TrainingArtifact.from_dict(data)
     if not Path(artifact.model_path).exists():
         raise FileNotFoundError(f"找不到训练好的模型文件: {artifact.model_path}")
+    if artifact.feature_scaler_path:
+        scaler_path = Path(artifact.feature_scaler_path)
+        if not scaler_path.exists():
+            alt_path = Path(artifact.model_path).parent / Path(artifact.feature_scaler_path).name
+            if alt_path.exists():
+                artifact.feature_scaler_path = str(alt_path)
     return artifact
 
 
-def _simulate_dca(df: pd.DataFrame, initial_cash: float, monthly_invest: float, fee: float) -> Tuple[pd.Series, float]:
+def _simulate_dca(
+    df: pd.DataFrame,
+    initial_cash: float,
+    monthly_invest: float,
+    fee: float,
+) -> Tuple[pd.Series, pd.Series]:
     cash = float(initial_cash)
     invested = float(initial_cash)
     shares = 0.0
     last_month: Optional[Tuple[int, int]] = None
     equity_values: List[float] = []
+    invested_history: List[float] = []
 
     for idx, (date, row) in enumerate(df.iterrows()):
         price = float(row["Close"])
@@ -816,6 +917,7 @@ def _simulate_dca(df: pd.DataFrame, initial_cash: float, monthly_invest: float, 
             price = np.nan
         if np.isnan(price):
             equity_values.append(cash + shares * (equity_values[-1] if equity_values else 0.0))
+            invested_history.append(invested)
             continue
 
         month_key = None
@@ -836,9 +938,11 @@ def _simulate_dca(df: pd.DataFrame, initial_cash: float, monthly_invest: float, 
                     cash = 0.0
         last_month = month_key
         equity_values.append(cash + shares * price)
+        invested_history.append(invested)
 
     equity_series = pd.Series(equity_values, index=df.index, name="定投策略")
-    return equity_series, invested
+    invested_series = pd.Series(invested_history, index=df.index, name="定投投入")
+    return equity_series, invested_series
 
 
 def _simulate_buy_and_hold(df: pd.DataFrame, initial_cash: float, fee: float) -> pd.Series:
@@ -904,12 +1008,27 @@ def run_ai_comparison_backtest(
 
     model = PPO.load(artifact.model_path, device=_resolve_device("cpu"))
 
+    feature_scaler: Optional[StandardScaler] = None
+    if artifact.feature_scaler_path:
+        scaler_path = Path(artifact.feature_scaler_path)
+        if not scaler_path.is_file():
+            alt_path = Path(artifact.model_path).parent / Path(artifact.feature_scaler_path).name
+            if alt_path.is_file():
+                scaler_path = alt_path
+        if scaler_path.is_file():
+            try:
+                with scaler_path.open("rb") as fh:
+                    feature_scaler = pickle.load(fh)
+            except Exception:
+                feature_scaler = None
+
     ai_metrics, ai_equity = _run_single_episode(
         model,
         test_df,
         initial_cash=initial_cash,
         fee=fee,
         monthly_cash=monthly_investment_amount,
+        feature_scaler=feature_scaler,
     )
 
     dca_equity, dca_invested = _simulate_dca(test_df, initial_cash, monthly_investment_amount, fee)
@@ -934,9 +1053,11 @@ def run_ai_comparison_backtest(
     equity_df = pd.concat(equity_frames.values(), axis=1).ffill().dropna(how="all")
     drawdown = {col: _compute_drawdown(equity_df[col]) for col in equity_df.columns}
 
+    total_dca_invested = float(dca_invested.iloc[-1]) if not dca_invested.empty else float(initial_cash)
+
     metrics = {
         "ai": _compute_performance_metrics(equity_df["AI策略"], ai_metrics["cash_added"]),
-        "dca": _compute_performance_metrics(equity_df["定投策略"], dca_invested),
+        "dca": _compute_performance_metrics(equity_df["定投策略"], total_dca_invested),
         "buy_and_hold": _compute_performance_metrics(equity_df["买入持有"], initial_cash),
     }
     if "基准指数" in equity_df.columns:
@@ -947,7 +1068,10 @@ def run_ai_comparison_backtest(
         "drawdown": drawdown,
         "metrics": metrics,
         "ai_episode": ai_metrics,
-        "dca_details": {"total_invested": dca_invested},
+        "dca_details": {
+            "total_invested": total_dca_invested,
+            "invested_series": dca_invested,
+        },
         "artifact": artifact.to_dict(),
     }
     return result

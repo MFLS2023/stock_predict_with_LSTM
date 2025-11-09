@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import math
+import pickle
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 try:
     from backtesting import Backtest, Strategy
@@ -256,12 +257,29 @@ def run_ppo_backtest(
     print(f"开始执行PPO回测，模型: {resolved_path}")
 
     df_prepared = _ensure_datetime_index(df_test)
+    feature_scaler = None
+    scaler_candidates = [
+        resolved_path.with_name("feature_scaler.pkl"),
+        resolved_path.parent / "feature_scaler.pkl",
+    ]
+    for candidate in scaler_candidates:
+        if candidate.is_file():
+            try:
+                with candidate.open("rb") as fh:
+                    feature_scaler = pickle.load(fh)
+                print(f"加载特征标准化器: {candidate}")
+                break
+            except Exception as exc:
+                print(f"警告: 无法加载特征标准化器 {candidate}: {exc}")
+
     model = PPO.load(str(resolved_path))
     env = DynamicGridEnv(
         df=df_prepared,
         initial_cash=float(initial_cash),
         monthly_invest=float(monthly_invest),
         fee=float(fee),
+        feature_scaler=feature_scaler,
+        fit_feature_scaler=feature_scaler is None,
     )
 
     obs, info = env.reset()

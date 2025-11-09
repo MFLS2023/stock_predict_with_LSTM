@@ -1,9 +1,12 @@
-import os
-import pandas as pd
+import pickle
 from pathlib import Path
+from typing import Optional
+
+import pandas as pd
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import configure
+
 from ai_strategy import DynamicGridEnv
 
 class LoggingCallback(BaseCallback):
@@ -42,6 +45,8 @@ def train_ppo_model(
     :return: Path to the saved model.
     """
     log_callback("开始 PPO 模型训练...")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     # 1. 创建环境
     env = DynamicGridEnv(df=df_train, initial_cash=100000)
@@ -82,6 +87,20 @@ def train_ppo_model(
     saved_model_path = output_dir / model_filename
     model.save(saved_model_path)
     log_callback(f"模型已保存至: {saved_model_path}")
+
+    scaler_path: Optional[Path] = None
+    feature_scaler = getattr(env, "feature_scaler", None)
+    if feature_scaler is not None:
+        scaler_path = output_dir / "feature_scaler.pkl"
+        try:
+            with scaler_path.open("wb") as fh:
+                pickle.dump(feature_scaler, fh)
+            log_callback(f"特征标准化器已保存至: {scaler_path}")
+        except Exception as exc:
+            log_callback(f"警告: 保存特征标准化器失败 - {exc}")
+            scaler_path = None
+
+    env.close()
     
     return saved_model_path
 
