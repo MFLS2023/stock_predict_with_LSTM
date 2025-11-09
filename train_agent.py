@@ -1,11 +1,28 @@
 import pickle
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import pandas as pd
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO as SB3PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import configure
+
+try:  # SB3 >= 2.0 first-party LSTM support (when available)
+    from stable_baselines3.ppo.policies import MlpLstmPolicy as PPO_LSTM_POLICY_CLASS
+    PPO_CLASS = SB3PPO
+except ImportError:  # pragma: no cover - fallback for older/newer layouts
+    try:
+        from stable_baselines3.common.policies import ActorCriticLstmPolicy as PPO_LSTM_POLICY_CLASS  # type: ignore
+        PPO_CLASS = SB3PPO
+    except ImportError:  # pragma: no cover - try sb3-contrib recurrent PPO
+        try:
+            from sb3_contrib.ppo_recurrent.policies import MlpLstmPolicy as PPO_LSTM_POLICY_CLASS  # type: ignore
+            from sb3_contrib import RecurrentPPO as SB3RecurrentPPO  # type: ignore
+
+            PPO_CLASS = SB3RecurrentPPO
+        except ImportError:  # pragma: no cover - LSTM policy unavailable
+            PPO_LSTM_POLICY_CLASS = None
+            PPO_CLASS = SB3PPO
 
 from ai_strategy import DynamicGridEnv
 
@@ -31,7 +48,8 @@ def train_ppo_model(
     output_dir: Path,
     model_filename: str,
     device: str = 'auto',
-    log_callback=print
+    log_callback=print,
+    ppo_kwargs: Optional[Dict[str, Any]] = None,
 ):
     """
     Trains a PPO model using the DynamicGridEnv.
@@ -42,6 +60,7 @@ def train_ppo_model(
     :param model_filename: Filename for the saved model.
     :param device: PyTorch device ('auto', 'cpu', 'cuda').
     :param log_callback: Function to handle log messages.
+    :param ppo_kwargs: Optional dictionary to override PPO keyword arguments.
     :return: Path to the saved model.
     """
     log_callback("开始 PPO 模型训练...")
@@ -58,22 +77,57 @@ def train_ppo_model(
 
     # 3. 创建 PPO 模型
     # 超参数可以根据需要进行调整
-    model = PPO(
-        "MlpPolicy",
-        env,
-        policy_kwargs=dict(net_arch=dict(pi=[128, 128], vf=[128, 128])),
+    if PPO_LSTM_POLICY_CLASS is not None:
+        default_policy: Any = PPO_LSTM_POLICY_CLASS
+        base_policy_kwargs: Dict[str, Any] = dict(
+            lstm_hidden_size=128,
+            n_lstm_layers=1,
+            net_arch=dict(pi=[128], vf=[128]),
+        )
+        if log_callback:
+            algo_name = getattr(PPO_CLASS, "__name__", "PPO")
+            log_callback(f"检测到稳定基线支持 LSTM Policy，使用 {algo_name}+MlpLstmPolicy 进行训练。")
+    else:
+        default_policy = "MlpPolicy"
+        base_policy_kwargs = dict(net_arch=dict(pi=[128, 128], vf=[128, 128]))
+        if log_callback:
+            log_callback("当前 stable-baselines3 版本缺少 MlpLstmPolicy，自动回退到 MlpPolicy。")
+
+    base_params: Dict[str, Any] = dict(
+        policy=default_policy,
+        env=env,
+        policy_kwargs=base_policy_kwargs,
         learning_rate=1e-4,
-        n_steps=2048,
+        n_steps=512,
         batch_size=64,
         n_epochs=10,
         gamma=0.995,
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.005,
-        verbose=0, # 设置为0，通过回调函数控制输出
+        verbose=0,  # 设置为0，通过回调函数控制输出
         device=device,
-        tensorboard_log=str(log_path)
+        tensorboard_log=str(log_path),
     )
+
+    if ppo_kwargs:
+        custom_policy_kwargs = ppo_kwargs.get("policy_kwargs") if isinstance(ppo_kwargs, dict) else None
+        merged = {k: v for k, v in ppo_kwargs.items() if k not in {"env", "tensorboard_log", "policy_kwargs"}}
+        base_params.update(merged)
+        if custom_policy_kwargs:
+            policy_kwargs = base_params["policy_kwargs"].copy()
+            policy_kwargs.update(custom_policy_kwargs)
+            base_params["policy_kwargs"] = policy_kwargs
+
+        if PPO_LSTM_POLICY_CLASS is None and isinstance(base_params["policy"], str) and base_params["policy"] == "MlpPolicy":
+            for key in list(base_params["policy_kwargs"].keys()):
+                if key in {"lstm_hidden_size", "n_lstm_layers"}:
+                    base_params["policy_kwargs"].pop(key, None)
+
+    base_params["env"] = env
+    base_params["tensorboard_log"] = str(log_path)
+
+    model = PPO_CLASS(**base_params)
     model.set_logger(new_logger)
     log_callback(f"PPO 模型已创建，将在 {device} 设备上进行训练。")
 

@@ -5,7 +5,7 @@ import pickle
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -14,18 +14,53 @@ from gymnasium import spaces
 from sklearn.preprocessing import StandardScaler
 
 try:  # pragma: no cover - optional dependency for RL
-    from stable_baselines3 import PPO
+    from stable_baselines3 import PPO as SB3PPO
     from stable_baselines3.common.vec_env import DummyVecEnv
 except ImportError:  # pragma: no cover - handled at runtime
-    PPO = None
+    SB3PPO = None
     DummyVecEnv = None
 
+PPO_CLASS: Any = SB3PPO
+PPO_LSTM_POLICY_CLASS: Optional[Any] = None
+
+if SB3PPO is not None:  # pragma: no cover - optional LSTM support detection
+    try:
+        from stable_baselines3.ppo.policies import MlpLstmPolicy as SB3MlpLstmPolicy
+        PPO_LSTM_POLICY_CLASS = SB3MlpLstmPolicy
+    except ImportError:  # pragma: no cover - SB3 < 2.0 style
+        try:
+            from stable_baselines3.common.policies import ActorCriticLstmPolicy as SB3LegacyLstmPolicy  # type: ignore
+            PPO_LSTM_POLICY_CLASS = SB3LegacyLstmPolicy
+        except ImportError:
+            pass
+
+if PPO_LSTM_POLICY_CLASS is None:  # pragma: no cover - sb3-contrib fallback
+    try:
+        from sb3_contrib import RecurrentPPO as SB3RecurrentPPO  # type: ignore
+        from sb3_contrib.ppo_recurrent.policies import MlpLstmPolicy as ContribMlpLstmPolicy  # type: ignore
+
+        PPO_CLASS = SB3RecurrentPPO
+        PPO_LSTM_POLICY_CLASS = ContribMlpLstmPolicy
+    except ImportError:
+        pass
+
+# Backwards compatibility aliases used throughout the module
+PPO = PPO_CLASS
+
 if TYPE_CHECKING:
-    from stable_baselines3 import PPO as PPOType
     from stable_baselines3.common.vec_env import DummyVecEnv as DummyVecEnvType
-else:  # pragma: no cover - typing fallback
-    PPOType = Any  # type: ignore[misc]
+
+    try:  # pragma: no cover - typing helper
+        from sb3_contrib import RecurrentPPO as _RecurrentPPOType  # type: ignore
+    except ImportError:  # pragma: no cover - contrib not installed
+        from stable_baselines3 import PPO as _RecurrentPPOType
+
+    from stable_baselines3 import PPO as _SB3PPOType
+
+    PPOType = Union[_SB3PPOType, _RecurrentPPOType]
+else:  # pragma: no cover - runtime fallback
     DummyVecEnvType = Any  # type: ignore[misc]
+    PPOType = Any  # type: ignore[misc]
 
 try:  # pragma: no cover - optional dependency for GPU detection
     import torch
@@ -172,6 +207,8 @@ class DynamicGridEnv(gym.Env):
         super().__init__()
 
         self.df = add_features(df.copy())
+        if self.df.empty:
+            raise ValueError("特征工程后数据为空，请检查原始数据是否充足且无缺失。")
         self.initial_cash = float(initial_cash)
         self.fee = float(fee)
         self.monthly_invest = float(monthly_invest)
@@ -195,11 +232,11 @@ class DynamicGridEnv(gym.Env):
         self.trade_penalty: float = 0.0005
 
         self.action_space = spaces.Box(
-            low=np.array([0.005, 0.01, 0.10], dtype=np.float32),
-            high=np.array([0.05, 0.10, 1.0], dtype=np.float32),
+            low=np.array([0.0, 0.0, 0.0, 0.01, 0.02], dtype=np.float32),
+            high=np.array([0.10, 0.10, 1.0, 0.20, 0.50], dtype=np.float32),
             dtype=np.float32,
         )
-        obs_dim = len(self.feature_columns) + 4  # 特征 + 账户状态
+        obs_dim = len(self.feature_columns) + 6  # 特征 + 账户状态 + 风控距离
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
         self.current_step: int = 0
@@ -215,8 +252,14 @@ class DynamicGridEnv(gym.Env):
         self.nav_index: List[Any] = []
         self._last_invest_month: Optional[Tuple[int, int]] = None
         self.current_date: Any = self._index_value(self.current_step)
-        self._last_action: np.ndarray = np.zeros(self.action_space.shape, dtype=np.float32)
-        self._position_cost: float = 0.0
+        self._last_action = np.zeros(self.action_space.shape, dtype=np.float32)
+        self._position_cost = 0.0
+        self.average_entry_price: float = 0.0
+        self.stop_loss_price: Optional[float] = None
+        self.take_profit_price: Optional[float] = None
+        self.prev_close_price: float = float(self.df["Close"].iloc[0]) if len(self.df) > 0 else 0.0
+        self.take_profit_reward_coef: float = 5.0
+        self.stop_loss_penalty_coef: float = 5.0
 
         self._dca_nav_series, self._dca_invested_series = _simulate_dca(
             self.df,
@@ -244,6 +287,10 @@ class DynamicGridEnv(gym.Env):
         self.current_date = self._index_value(self.current_step)
         self._last_action = np.zeros(self.action_space.shape, dtype=np.float32)
         self._position_cost = 0.0
+        self.average_entry_price = 0.0
+        self.stop_loss_price = None
+        self.take_profit_price = None
+        self.prev_close_price = float(self.df["Close"].iloc[0]) if len(self.df) > 0 else 0.0
         self._record_nav()
         return self._get_obs(), self._get_info()
 
@@ -256,6 +303,48 @@ class DynamicGridEnv(gym.Env):
     def _record_nav(self) -> None:
         self.nav_history.append(float(self.portfolio_value))
         self.nav_index.append(self._index_value(self.current_step))
+
+    def _refresh_average_entry_price(self) -> None:
+        if self.holding_shares > 1e-8:
+            self.average_entry_price = self._position_cost / max(self.holding_shares, 1e-8)
+        else:
+            self.average_entry_price = 0.0
+
+    def _update_risk_targets_after_buy(
+        self,
+        *,
+        current_price: float,
+        stop_loss_pct: float,
+        take_profit_pct: float,
+    ) -> None:
+        self._refresh_average_entry_price()
+        if self.holding_shares <= 1e-8:
+            self.stop_loss_price = None
+            self.take_profit_price = None
+            return
+
+        new_stop = self.average_entry_price * (1.0 - float(stop_loss_pct))
+        if self.stop_loss_price is None:
+            adjusted_stop = new_stop
+        else:
+            adjusted_stop = max(self.stop_loss_price, new_stop)
+        max_allowed_stop = current_price * (1.0 - 1e-4)
+        self.stop_loss_price = max(min(adjusted_stop, max_allowed_stop), 0.0)
+
+        new_take = self.average_entry_price * (1.0 + float(take_profit_pct))
+        if self.take_profit_price is None:
+            adjusted_take = new_take
+        else:
+            adjusted_take = max(self.take_profit_price, new_take)
+        min_allowed_take = current_price * (1.0 + 1e-4)
+        self.take_profit_price = max(adjusted_take, min_allowed_take)
+
+    def _maybe_raise_stop_to_breakeven(self, current_price: float) -> None:
+        if self.holding_shares <= 1e-8 or self.average_entry_price <= 0.0:
+            return
+        candidate_stop = max(self.stop_loss_price or 0.0, self.average_entry_price)
+        max_allowed_stop = current_price * (1.0 - 1e-4)
+        self.stop_loss_price = min(max(candidate_stop, 0.0), max_allowed_stop)
 
     def _apply_monthly_investment(self) -> float:
         if self.monthly_invest <= 0 or not isinstance(self.df.index, pd.DatetimeIndex):
@@ -280,29 +369,34 @@ class DynamicGridEnv(gym.Env):
             return np.zeros(self.observation_space.shape, dtype=np.float32)
 
         row = self.df.iloc[self.current_step]
-        feature_array = row[list(self.feature_columns)].astype(float).to_numpy().reshape(1, -1)
-        if self.feature_scaler is not None:
-            market_features = self.feature_scaler.transform(feature_array)[0]
-        else:
-            market_features = feature_array[0]
+        current_price = float(row["Close"])
+        market_features = row[list(self.feature_columns)].astype(float).to_numpy(dtype=np.float32)
         market_features = np.nan_to_num(market_features, nan=0.0)
-        market_features = np.asarray(market_features, dtype=np.float32)
 
         unrealized_pnl = 0.0
         if self.holding_shares > 0 and self.last_trade_price > 0:
-            unrealized_pnl = (float(row["Close"]) - self.last_trade_price) / max(self.last_trade_price, 1e-8)
+            unrealized_pnl = (current_price - self.last_trade_price) / max(self.last_trade_price, 1e-8)
 
         account_state = np.array(
             [
                 self.portfolio_value / max(self.cash_added, 1e-8),
                 self.cash / max(self.portfolio_value, 1e-8),
-                (self.holding_shares * float(row["Close"])) / max(self.portfolio_value, 1e-8),
+                (self.holding_shares * current_price) / max(self.portfolio_value, 1e-8),
                 unrealized_pnl,
             ],
             dtype=np.float32,
         )
 
-        return np.concatenate([market_features, account_state])
+        distance_to_stop = 0.0
+        distance_to_take = 0.0
+        if self.holding_shares > 0:
+            if self.stop_loss_price is not None and current_price > 0:
+                distance_to_stop = max((current_price - self.stop_loss_price) / max(current_price, 1e-8), 0.0)
+            if self.take_profit_price is not None and current_price > 0:
+                distance_to_take = max((self.take_profit_price - current_price) / max(current_price, 1e-8), 0.0)
+
+        risk_features = np.array([distance_to_stop, distance_to_take], dtype=np.float32)
+        return np.concatenate([market_features, account_state, risk_features])
 
     def _get_info(self) -> Dict[str, Any]:
         return {
@@ -322,6 +416,8 @@ class DynamicGridEnv(gym.Env):
         dca_return: float,
         cost_this_step: float,
         last_portfolio_value: float,
+        risk_event: Optional[str] = None,
+        realized_risk_profit: float = 0.0,
     ) -> float:
         """基于超额收益的奖励函数 (V2)。"""
 
@@ -329,32 +425,91 @@ class DynamicGridEnv(gym.Env):
         transaction_penalty = cost_this_step / max(last_portfolio_value, 1.0)
         reward_scaling_factor = 100.0
         reward = excess_return * reward_scaling_factor - transaction_penalty
+
+        if risk_event == "take_profit":
+            realized_gain = max(realized_risk_profit, 0.0)
+            reward += self.take_profit_reward_coef * (realized_gain / max(last_portfolio_value, 1.0))
+        elif risk_event == "stop_loss":
+            realized_loss = abs(min(realized_risk_profit, 0.0))
+            reward -= self.stop_loss_penalty_coef * (realized_loss / max(last_portfolio_value, 1.0))
+
         return float(reward)
 
     def step(self, action: Sequence[float]):
         if self.current_step >= len(self.df) - 1:
             info_terminal = self._get_info()
             info_terminal["trades"] = []
+            info_terminal["risk_event"] = None
             return self._get_obs(), 0.0, True, False, info_terminal
 
         action_array = np.clip(np.asarray(action, dtype=np.float32), self.action_space.low, self.action_space.high)
         self._last_action = action_array.copy()
-        position_size = float(action_array[2])
+        buy_threshold, sell_threshold, target_position_ratio, stop_loss_pct, take_profit_pct = action_array.tolist()
+
         current_row = self.df.iloc[self.current_step]
         current_price = float(current_row["Close"])
-        self.current_date = self._index_value(self.current_step)
-        trades_this_step: List[Dict[str, Any]] = []
-        deposit = self._apply_monthly_investment()
-        prev_value = max(self.portfolio_value, 1e-8)
-        cost_this_step = 0.0
-
-        target_value = self.portfolio_value * position_size
-        current_value = self.holding_shares * current_price
-
         if current_price <= 0:
             current_price = max(current_price, 1e-6)
 
-        if target_value > current_value + 1e-8:
+        self.current_date = self._index_value(self.current_step)
+        trades_this_step: List[Dict[str, Any]] = []
+        prev_value = max(self.portfolio_value, 1e-8)
+        cost_this_step = 0.0
+        realized_risk_profit = 0.0
+        risk_event: Optional[str] = None
+
+        price_change = 0.0
+        if self.prev_close_price > 0:
+            price_change = (current_price - self.prev_close_price) / max(self.prev_close_price, 1e-8)
+
+        deposit = self._apply_monthly_investment()
+
+        # 风控检查优先
+        if self.holding_shares > 0:
+            if self.stop_loss_price is not None and current_price <= self.stop_loss_price:
+                risk_event = "stop_loss"
+            elif self.take_profit_price is not None and current_price >= self.take_profit_price:
+                risk_event = "take_profit"
+
+            if risk_event is not None:
+                shares_to_sell = self.holding_shares
+                proceeds = shares_to_sell * current_price
+                commission_paid = self._calculate_commission(proceeds)
+                net_proceeds = proceeds - commission_paid
+                cost_this_step += commission_paid
+                cost_released = self._position_cost
+                
+                self.holding_shares = 0.0
+                self.cash += net_proceeds
+                self.total_commission += commission_paid
+                realized_risk_profit = net_proceeds - cost_released
+                self._position_cost = 0.0
+                
+                trades_this_step.append({
+                    "时间": self.current_date, "方向": "止盈" if risk_event == "take_profit" else "止损",
+                    "价格": current_price, "数量": float(shares_to_sell), "金额": float(net_proceeds),
+                    "手续费": float(commission_paid), "盈亏": float(realized_risk_profit),
+                })
+                
+                self.last_trade_price = 0.0
+                self.stop_loss_price = None
+                self.take_profit_price = None
+                self.average_entry_price = 0.0
+
+        # 常规交易逻辑
+        self.portfolio_value = self.cash + self.holding_shares * current_price
+        current_value = self.holding_shares * current_price
+        current_ratio = current_value / max(self.portfolio_value, 1e-8)
+        
+        desired_ratio = current_ratio
+        clipped_target = float(np.clip(target_position_ratio, 0.0, 1.0))
+        if price_change >= buy_threshold:
+            desired_ratio = clipped_target
+        elif price_change <= -sell_threshold:
+            desired_ratio = clipped_target
+
+        if desired_ratio > current_ratio + 1e-8:
+            target_value = np.clip(self.portfolio_value * desired_ratio, 0.0, self.portfolio_value)
             amount_needed = target_value - current_value
             max_affordable = self._max_affordable_buy_amount()
             amount_to_buy = min(max(amount_needed, 0.0), max_affordable)
@@ -362,35 +517,26 @@ class DynamicGridEnv(gym.Env):
                 shares_to_buy = amount_to_buy / current_price
                 commission_paid = self._calculate_commission(amount_to_buy)
                 total_cost = amount_to_buy + commission_paid
+                
                 self.holding_shares += shares_to_buy
                 self.cash -= total_cost
                 self.last_trade_price = current_price
                 self.total_commission += commission_paid
                 cost_this_step += commission_paid
                 self._position_cost += total_cost
-                trade_entry = {
-                    "step": self.current_step,
-                    "type": "buy",
-                    "shares": float(shares_to_buy),
-                    "price": current_price,
-                    "value": float(amount_to_buy),
-                    "timestamp": self.current_date,
-                    "commission": float(commission_paid),
-                    "profit": float(-total_cost),
-                }
-                self.trades.append(trade_entry)
-                trades_this_step.append(
-                    {
-                        "时间": self.current_date,
-                        "方向": "买入",
-                        "价格": current_price,
-                        "数量": float(shares_to_buy),
-                        "金额": -float(total_cost),
-                        "手续费": float(commission_paid),
-                        "盈亏": 0.0,
-                    }
+                self._update_risk_targets_after_buy(
+                    current_price=current_price,
+                    stop_loss_pct=float(stop_loss_pct),
+                    take_profit_pct=float(take_profit_pct),
                 )
-        elif target_value + 1e-8 < current_value and self.holding_shares > 0:
+                
+                trades_this_step.append({
+                    "时间": self.current_date, "方向": "买入", "价格": current_price,
+                    "数量": float(shares_to_buy), "金额": -float(total_cost),
+                    "手续费": float(commission_paid), "盈亏": 0.0,
+                })
+        elif desired_ratio + 1e-8 < current_ratio and self.holding_shares > 0:
+            target_value = np.clip(self.portfolio_value * desired_ratio, 0.0, self.portfolio_value)
             amount_to_release = current_value - target_value
             shares_to_sell = min(self.holding_shares, amount_to_release / current_price)
             if shares_to_sell > 0:
@@ -400,34 +546,29 @@ class DynamicGridEnv(gym.Env):
                 ratio = float(shares_to_sell) / holding_before
                 cost_released = self._position_cost * ratio
                 net_proceeds = proceeds - commission_paid
+                
                 self.holding_shares -= shares_to_sell
                 self.cash += net_proceeds
                 self.total_commission += commission_paid
                 cost_this_step += commission_paid
                 self._position_cost = max(self._position_cost - cost_released, 0.0)
                 profit = net_proceeds - cost_released
-                trade_entry = {
-                    "step": self.current_step,
-                    "type": "sell",
-                    "shares": float(shares_to_sell),
-                    "price": current_price,
-                    "value": float(proceeds),
-                    "timestamp": self.current_date,
-                    "commission": float(commission_paid),
-                    "profit": float(profit),
-                }
-                self.trades.append(trade_entry)
-                trades_this_step.append(
-                    {
-                        "时间": self.current_date,
-                        "方向": "卖出",
-                        "价格": current_price,
-                        "数量": float(shares_to_sell),
-                        "金额": float(net_proceeds),
-                        "手续费": float(commission_paid),
-                        "盈亏": float(profit),
-                    }
-                )
+                
+                if self.holding_shares <= 1e-8: # 仓位已清空
+                    self.stop_loss_price = None
+                    self.take_profit_price = None
+                    self.last_trade_price = 0.0
+                    self.average_entry_price = 0.0
+                else:
+                    self._refresh_average_entry_price()
+                    if profit > 0.0:
+                        self._maybe_raise_stop_to_breakeven(current_price)
+                
+                trades_this_step.append({
+                    "时间": self.current_date, "方向": "卖出", "价格": current_price,
+                    "数量": float(shares_to_sell), "金额": float(net_proceeds),
+                    "手续费": float(commission_paid), "盈亏": float(profit),
+                })
 
         self.portfolio_value = self.cash + self.holding_shares * current_price
 
@@ -450,6 +591,8 @@ class DynamicGridEnv(gym.Env):
             dca_return=dca_return,
             cost_this_step=cost_this_step,
             last_portfolio_value=prev_value,
+            risk_event=risk_event,
+            realized_risk_profit=realized_risk_profit,
         )
 
         self.total_reward += reward
@@ -458,10 +601,15 @@ class DynamicGridEnv(gym.Env):
         terminated = self.portfolio_value <= self.initial_cash * 0.3
         truncated = self.current_step >= len(self.df) - 1
 
+        self.prev_close_price = current_price
+
         self._record_nav()
         info = self._get_info()
         info["trades"] = trades_this_step
         info["last_action"] = action_array.tolist()
+        info["risk_event"] = risk_event
+        info["stop_loss_price"] = self.stop_loss_price
+        info["take_profit_price"] = self.take_profit_price
         return self._get_obs(), float(reward), terminated, truncated, info
 
     def _max_affordable_buy_amount(self) -> float:
@@ -630,12 +778,25 @@ def _run_single_episode(
     )
     obs, _ = env.reset()
     total_reward = 0.0
+    lstm_state = None
+    episode_start = np.array([True], dtype=bool)
+
     while True:
-        action, _ = model.predict(obs, deterministic=True)
+        action, lstm_state = model.predict(
+            obs,
+            state=lstm_state,
+            episode_start=episode_start,
+            deterministic=True,
+        )
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += float(reward)
+
         if terminated or truncated:
+            episode_start = np.array([True], dtype=bool)
+            lstm_state = None
             break
+
+        episode_start = np.array([False], dtype=bool)
     metrics = {
         "final_nav": float(env.portfolio_value),
         "cash_added": float(env.cash_added),
@@ -723,6 +884,24 @@ def _load_json(path: Path) -> Dict[str, Any]:
         return json.load(fh)
 
 
+def _resolve_policy(default_net_arch: Optional[Dict[str, Any]] = None) -> Tuple[Any, Dict[str, Any], str]:
+    """Return the default policy, kwargs, and human-readable name."""
+
+    if default_net_arch is None:
+        default_net_arch = dict(pi=[128, 128], vf=[128, 128])
+
+    if PPO_LSTM_POLICY_CLASS is not None:
+        policy_kwargs: Dict[str, Any] = dict(
+            lstm_hidden_size=128,
+            n_lstm_layers=1,
+            net_arch=default_net_arch,
+        )
+        return PPO_LSTM_POLICY_CLASS, policy_kwargs, "LSTM"
+
+    policy_kwargs = dict(net_arch=default_net_arch)
+    return "MlpPolicy", policy_kwargs, "MLP"
+
+
 def train_ai_strategy(
     df: pd.DataFrame,
     framework: str,
@@ -733,7 +912,7 @@ def train_ai_strategy(
     initial_cash: float = 100_000.0,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> TrainingArtifact:
-    if PPO is None or DummyVecEnv is None:
+    if PPO_CLASS is None or DummyVecEnv is None:
         raise ImportError(
             "未检测到 stable-baselines3，请先执行 `pip install stable-baselines3[extra]` 安装依赖。"
         )
@@ -767,9 +946,10 @@ def train_ai_strategy(
     except Exception:
         train_feature_scaler = None
 
-    policy_kwargs = dict(net_arch=dict(pi=[128, 128], vf=[128, 128]))
-    model = PPO(
-        "MlpPolicy",
+    policy, policy_kwargs, policy_name = _resolve_policy()
+
+    model = PPO_CLASS(
+        policy,
         vec_env,
         learning_rate=config.learning_rate,
         n_steps=min(config.n_steps, max(128, len(train_df) // 2)),
@@ -782,6 +962,12 @@ def train_ai_strategy(
         policy_kwargs=policy_kwargs,
         device=device,
     )
+
+    algo_name = getattr(PPO_CLASS, "__name__", "PPO")
+    if policy_name == "LSTM":
+        _log(logger, f"检测到稳定基线支持 LSTM Policy，使用 {algo_name}+LSTM 进行训练。")
+    else:
+        _log(logger, f"当前环境缺少 LSTM Policy，将使用 {algo_name}+MLP Policy 训练。")
 
     total_timesteps = max(config.total_timesteps, config.epochs)
     epochs = max(config.epochs, 1)
@@ -1016,7 +1202,23 @@ def run_ai_comparison_backtest(
 ) -> Dict[str, Any]:
     test_df = _prepare_price_dataframe(df)
 
-    model = PPO.load(artifact.model_path, device=_resolve_device("cpu"))
+    load_device = _resolve_device("cpu")
+    model: Optional[PPOType] = None
+    load_attempts: List[str] = []
+
+    for loader in [PPO_CLASS, SB3PPO]:
+        if loader is None:
+            continue
+        loader_name = getattr(loader, "__name__", "PPO")
+        try:
+            model = loader.load(artifact.model_path, device=load_device)
+            break
+        except Exception as exc:  # pragma: no cover - fallback path
+            load_attempts.append(f"{loader_name}: {exc}")
+
+    if model is None:
+        detail = "; ".join(load_attempts) or "未找到可用的 PPO 加载器"
+        raise RuntimeError(f"无法加载模型文件 {artifact.model_path}: {detail}")
 
     feature_scaler: Optional[StandardScaler] = None
     if artifact.feature_scaler_path:

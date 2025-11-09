@@ -298,7 +298,13 @@ def run_ppo_backtest(
     equity_curve = env.get_nav_series()
     equity_curve.name = "PPO 动态策略"
 
-    action_columns = ["网格间距", "止损比例", "仓位比例"]
+    action_columns = [
+        "买入阈值",
+        "卖出阈值",
+        "目标仓位",
+        "止损百分比",
+        "止盈百分比",
+    ]
     action_count = len(action_log)
     if action_count > 0:
         if len(equity_curve) > 1:

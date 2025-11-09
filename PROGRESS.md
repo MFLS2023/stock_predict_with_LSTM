@@ -15,7 +15,7 @@
 ### **系统架构 (System Architecture) - v2.0 标准**
 
 1.  **智能体 (The Agent - “大脑”)**
-    *   **技术选型**: **PPO（Proximal Policy Optimization）** 算法。
+    *   **技术选型**: **PPO（Proximal Policy Optimization）** 算法，当前默认策略为 `MlpLstmPolicy`，能够记忆时间序列模式。
     *   **实现**: 通过集成 `stable-baselines3` 这个专业的强化学习库来完成。
 
 2.  **状态空间 (State Space - “眼睛”)**
@@ -23,28 +23,16 @@
     *   **构成**: 基于知行均线的特征体系，并包含投资组合的动态状态。
 
 3.  **动作空间 (Action Space - “双手”)**
-    *   **定义**: AI可以执行的操作，即输出一套网格参数。
-    *   **构成**: 一个包含多个**连续值**的向量: `[grid_interval, stop_loss_rate, position_size]`。
+    *   **定义**: AI可以执行的操作，即输出一套风控驱动的组合指令。
+    *   **构成**: 一个包含五个**连续值**的向量: `[buy_threshold, sell_threshold, target_position, stop_loss_pct, take_profit_pct]`，用于决定何时调仓以及新建仓位时的止盈/止损线。
 
 4.  **环境 (Environment - “训练场”)**
     *   **定义**: 模拟真实交易，并为AI提供反馈的虚拟世界。
-    *   **构成**: `ai_strategy.py` 中符合 `gymnasium` 标准的自定义环境 `DynamicGridEnv`。
+    *   **构成**: `ai_strategy.py` 中符合 `gymnasium` 标准的自定义环境 `DynamicGridEnv`，支持动态止盈止损、风险距离观测以及与定投基准对比的奖励机制。
 
 5.  **奖励函数 (Reward Function - “计分板”)**
     *   **定义**: 评估AI动作好坏的唯一标准。
-    *   **构成**: 以最大化“超额收益”为核心，同时对“最大回撤”和“交易成本”进行惩罚。
-    ```python
-    def calculate_reward(portfolio_return, dca_return, max_drawdown, transaction_cost):
-        # 核心目标：超越定投基准
-        excess_return = portfolio_return - dca_return
-        base_reward = excess_return * 5  # 放大信号
-
-        # 风险控制
-        drawdown_penalty = -0.3 * max(0, max_drawdown + 0.05)  # 回撤超过5%开始惩罚
-        cost_penalty = -0.0002 * transaction_cost
-
-        return base_reward + drawdown_penalty + cost_penalty
-    ```
+    *   **构成**: 以最大化“超额收益”并最小化“交易成本”为基础，同时针对触发止盈给予额外正奖励、触发止损给予额外惩罚，引导策略在盈利时让利润奔跑、亏损时快速脱身。
 
 ---
 
@@ -70,5 +58,12 @@
     *   [ ] **4.1. 评估与分析 (当前步骤)**: 分析首次训练的结果，并根据“训练时间过长”的反馈优化训练流程。
     *   [ ] **4.2. 实现评估体系**: 计算超额收益、最大回撤、夏普比率等关键指标。
     *   [ ] **4.3. 结果可视化**: 绘制AI动态网格、静态网格、定投策略的收益对比曲线。
+
+**第五阶段：自适应进化与调参引擎**
+*   **状态**: `启动`
+*   **任务**:
+    *   [X] **5.1. Optuna 调参脚本**: 新增 `tune.py`，支持自动化搜索学习率、n_steps、LSTM 隐藏维度等关键超参数。
+    *   [ ] **5.2. 批量实验管理**: 基于 Study Storage 持续积累试验结果，形成可复现的调参工作流。
+    *   [ ] **5.3. 最优参数回放**: 将最优参数回写到正式训练流程，形成迭代闭环。
 
 ---

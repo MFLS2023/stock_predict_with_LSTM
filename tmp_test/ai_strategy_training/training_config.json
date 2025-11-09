@@ -1,0 +1,18 @@
+{
+  "epochs": 1,
+  "total_timesteps": 256,
+  "batch_size": 64,
+  "learning_rate": 0.0003,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "clip_range": 0.2,
+  "ent_coef": 0.0,
+  "stop_loss_init": 0.05,
+  "take_profit_init": 0.1,
+  "monthly_cash": 0.0,
+  "fee": 0.001,
+  "device_preference": "auto",
+  "seed": 42,
+  "n_steps": 128,
+  "eval_episodes": 1
+}

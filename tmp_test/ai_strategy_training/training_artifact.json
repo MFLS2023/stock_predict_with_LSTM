@@ -1,0 +1,31 @@
+{
+  "framework": "pytorch",
+  "model_path": "tmp_test\\ai_strategy_training\\ai_pytorch_model.zip",
+  "config_path": "tmp_test\\ai_strategy_training\\training_config.json",
+  "metadata_path": "tmp_test\\ai_strategy_training\\training_artifact.json",
+  "epochs": 1,
+  "total_timesteps": 256,
+  "monthly_cash": 0.0,
+  "fee": 0.001,
+  "device_preference": "auto",
+  "feature_scaler_path": "tmp_test\\ai_strategy_training\\feature_scaler.pkl",
+  "best_epoch": 1,
+  "best_metrics": {
+    "final_nav": 98598.01786359842,
+    "cash_added": 100000.0,
+    "total_reward": -95.92539306891425,
+    "num_trades": 0
+  },
+  "training_history": [
+    {
+      "epoch": 1,
+      "timesteps": 256,
+      "final_nav": 98598.01786359842,
+      "cash_added": 100000.0,
+      "reward": -95.92539306891425,
+      "num_trades": 0,
+      "timestamp": "2025-11-09T09:30:02.839146+00:00"
+    }
+  ],
+  "created_at": "2025-11-09T09:30:02.906883+00:00"
+}
