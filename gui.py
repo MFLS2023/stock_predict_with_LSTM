@@ -7,7 +7,7 @@ import time
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, TYPE_CHECKING
 
 import matplotlib
 matplotlib.use('Qt5Agg')
@@ -30,7 +30,7 @@ ensure_chinese_fonts()
 import numpy as np
 import pandas as pd
 
-from backtest import run_ai_comparison_backtest, run_backtest, run_grid_backtest
+from backtest import run_ai_comparison_backtest, run_backtest, run_dca_backtest, run_grid_backtest
 
 from train_agent import train_ppo_model
 
@@ -249,6 +249,22 @@ class MainWindow(QMainWindow):
         self.log_view: Optional[QPlainTextEdit] = None
         self.status_label: Optional[QLabel] = None
         self._log_buffer: list[str] = []
+
+        # Backtest strategy UI state
+        self.strategy_combo: Optional[QComboBox] = None
+        self.train_start_edit: Optional[QDateEdit] = None
+        self.train_end_edit: Optional[QDateEdit] = None
+        self.test_start_edit: Optional[QDateEdit] = None
+        self.test_end_edit: Optional[QDateEdit] = None
+        self.strategy_initial_cash_spin: Optional[QDoubleSpinBox] = None
+        self.strategy_fee_spin: Optional[QDoubleSpinBox] = None
+        self.dca_monthly_amount_spin: Optional[QDoubleSpinBox] = None
+        self.grid_interval_percent_spin: Optional[QDoubleSpinBox] = None
+        self.grid_num_lower_spin: Optional[QSpinBox] = None
+        self.grid_num_upper_spin: Optional[QSpinBox] = None
+        self.grid_order_size_spin: Optional[QDoubleSpinBox] = None
+        self.ai_group: Optional[QGroupBox] = None
+        self._strategy_field_map: Dict[Tuple[QWidget, QWidget], Set[str]] = {}
 
         # AI 策略线程与状态
         self.ai_training_thread: Optional[PpoTrainingThread] = None
@@ -679,9 +695,17 @@ class MainWindow(QMainWindow):
         qmin = QDate(min_date.year, min_date.month, min_date.day)
         qmax = QDate(max_date.year, max_date.month, max_date.day)
 
-        for widget in (self.ai_train_start, self.ai_train_end, self.ai_test_start, self.ai_test_end):
-            widget.setMinimumDate(qmin)
-            widget.setMaximumDate(qmax)
+        ai_widgets = [self.ai_train_start, self.ai_train_end, self.ai_test_start, self.ai_test_end]
+        for widget in ai_widgets:
+            if widget is not None:
+                widget.setMinimumDate(qmin)
+                widget.setMaximumDate(qmax)
+
+        generic_widgets = [self.train_start_edit, self.train_end_edit, self.test_start_edit, self.test_end_edit]
+        for widget in generic_widgets:
+            if widget is not None:
+                widget.setMinimumDate(qmin)
+                widget.setMaximumDate(qmax)
 
         sorted_dates = dates.sort_values()
         candidate_split = sorted_dates.iloc[-1] - pd.DateOffset(years=2)
@@ -693,10 +717,25 @@ class MainWindow(QMainWindow):
             split_date = sorted_dates.iloc[median_idx].date()
             qsplit = QDate(split_date.year, split_date.month, split_date.day)
 
-            self.ai_train_start.setDate(qmin)
-            self.ai_train_end.setDate(qsplit)
-            self.ai_test_start.setDate(qsplit.addDays(1))
-            self.ai_test_end.setDate(qmax)
+            if self.ai_train_start is not None:
+                self.ai_train_start.setDate(qmin)
+            if self.ai_train_end is not None:
+                self.ai_train_end.setDate(qsplit)
+            if self.ai_test_start is not None:
+                self.ai_test_start.setDate(qsplit.addDays(1))
+            if self.ai_test_end is not None:
+                self.ai_test_end.setDate(qmax)
+
+            if self.train_start_edit is not None:
+                self.train_start_edit.setDate(qmin)
+            if self.train_end_edit is not None:
+                self.train_end_edit.setDate(qsplit)
+            if self.test_start_edit is not None:
+                self.test_start_edit.setDate(qsplit.addDays(1))
+            if self.test_end_edit is not None:
+                self.test_end_edit.setDate(qmax)
+
+            self.append_log("数据不足两年，默认采用 70% 训练 / 30% 测试 的日期拆分。")
         else:
             test_start = sorted_dates[sorted_dates >= candidate_split].iloc[0].date()
             train_end = test_start - timedelta(days=1)
@@ -706,12 +745,31 @@ class MainWindow(QMainWindow):
             qtrain_end = QDate(train_end.year, train_end.month, train_end.day)
             qtest_start = QDate(test_start.year, test_start.month, test_start.day)
 
-            self.ai_train_start.setDate(qmin)
-            self.ai_train_end.setDate(qtrain_end)
-            self.ai_test_start.setDate(qtest_start)
-            self.ai_test_end.setDate(qmax)
+            if self.ai_train_start is not None:
+                self.ai_train_start.setDate(qmin)
+            if self.ai_train_end is not None:
+                self.ai_train_end.setDate(qtrain_end)
+            if self.ai_test_start is not None:
+                self.ai_test_start.setDate(qtest_start)
+            if self.ai_test_end is not None:
+                self.ai_test_end.setDate(qmax)
+
+            if self.train_start_edit is not None:
+                self.train_start_edit.setDate(qmin)
+            if self.train_end_edit is not None:
+                self.train_end_edit.setDate(qtrain_end)
+            if self.test_start_edit is not None:
+                self.test_start_edit.setDate(qtest_start)
+            if self.test_end_edit is not None:
+                self.test_end_edit.setDate(qmax)
+
             self.append_log(
                 "AI 日期拆分: 默认使用历史至两年前作为训练集，最近两年作为测试集。"
+            )
+
+        if self.test_start_edit is not None and self.test_end_edit is not None:
+            self.append_log(
+                f"回测默认区间: {self.test_start_edit.date().toString('yyyy-MM-dd')} 至 {self.test_end_edit.date().toString('yyyy-MM-dd')}"
             )
 
     def show_kline(self) -> None:
@@ -1029,63 +1087,120 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(backtest_tab, "策略回测 (Backtest Engine)")
         layout = QVBoxLayout(backtest_tab)
 
-        # --- 占位符，未来实现网格策略时将替换为真实控件 ---
-        # --- Placeholder, will be replaced with real controls for grid strategy ---
         form_layout = QFormLayout()
+        form_layout.setLabelAlignment(Qt.AlignRight)
+
         self.strategy_combo = QComboBox()
-        self.strategy_combo.addItems(["均线策略 (MA Crossover)", "网格策略 (Grid Trading)"])
-        form_layout.addRow("选择策略 (Strategy):", self.strategy_combo)
+        self.strategy_combo.addItem("均线策略 (MA Crossover)", "ma")
+        self.strategy_combo.addItem("定投策略 (Dollar-Cost Averaging)", "dca")
+        self.strategy_combo.addItem("网格策略 (Grid Trading)", "grid")
+        self.strategy_combo.addItem("AI 动态策略 (PPO)", "ai")
+        strategy_label = QLabel("选择策略 (Strategy):")
+        form_layout.addRow(strategy_label, self.strategy_combo)
+        self._register_strategy_form_field("all", strategy_label, self.strategy_combo)
 
-        # --- Grid Trading Strategy Parameters ---
-        self.grid_initial_cash_spin = QDoubleSpinBox()
-        self.grid_initial_cash_spin.setRange(0.0, 1_000_000_000.0)
-        self.grid_initial_cash_spin.setDecimals(2)
-        self.grid_initial_cash_spin.setSingleStep(1_000.0)
-        self.grid_initial_cash_spin.setValue(100000.0)
-        self._prepare_spinbox(self.grid_initial_cash_spin, "初始资金，可直接输入")
-        form_layout.addRow("初始资金 (Initial Cash):", self.grid_initial_cash_spin)
+        date_format = "yyyy-MM-dd"
+        today = QDate.currentDate()
 
-        self.grid_fee_spin = QDoubleSpinBox()
-        self.grid_fee_spin.setRange(0.0, 1.0)
-        self.grid_fee_spin.setDecimals(5)
-        self.grid_fee_spin.setSingleStep(0.0001)
-        self.grid_fee_spin.setValue(0.001)
-        self._prepare_spinbox(self.grid_fee_spin, "手续费比例 0~1")
-        form_layout.addRow("交易手续费 (Fee):", self.grid_fee_spin)
+        def _configure_date_edit(edit: QDateEdit) -> None:
+            edit.setCalendarPopup(True)
+            edit.setDisplayFormat(date_format)
+            edit.setDate(today)
+
+        self.train_start_edit = QDateEdit()
+        _configure_date_edit(self.train_start_edit)
+        train_start_label = QLabel("训练开始 (Train From):")
+        form_layout.addRow(train_start_label, self.train_start_edit)
+        self._register_strategy_form_field(["ma", "dca", "grid"], train_start_label, self.train_start_edit)
+
+        self.train_end_edit = QDateEdit()
+        _configure_date_edit(self.train_end_edit)
+        train_end_label = QLabel("训练结束 (Train To):")
+        form_layout.addRow(train_end_label, self.train_end_edit)
+        self._register_strategy_form_field(["ma", "dca", "grid"], train_end_label, self.train_end_edit)
+
+        self.test_start_edit = QDateEdit()
+        _configure_date_edit(self.test_start_edit)
+        test_start_label = QLabel("测试开始 (Test From):")
+        form_layout.addRow(test_start_label, self.test_start_edit)
+        self._register_strategy_form_field(["ma", "dca", "grid"], test_start_label, self.test_start_edit)
+
+        self.test_end_edit = QDateEdit()
+        _configure_date_edit(self.test_end_edit)
+        test_end_label = QLabel("测试结束 (Test To):")
+        form_layout.addRow(test_end_label, self.test_end_edit)
+        self._register_strategy_form_field(["ma", "dca", "grid"], test_end_label, self.test_end_edit)
+
+        self.strategy_initial_cash_spin = QDoubleSpinBox()
+        self.strategy_initial_cash_spin.setRange(0.0, 1_000_000_000.0)
+        self.strategy_initial_cash_spin.setDecimals(2)
+        self.strategy_initial_cash_spin.setSingleStep(1_000.0)
+        self.strategy_initial_cash_spin.setValue(100_000.0)
+        self._prepare_spinbox(self.strategy_initial_cash_spin, "初始资金，可直接输入")
+        initial_cash_label = QLabel("初始资金 (Initial Cash):")
+        form_layout.addRow(initial_cash_label, self.strategy_initial_cash_spin)
+        self._register_strategy_form_field(["ma", "dca", "grid"], initial_cash_label, self.strategy_initial_cash_spin)
+
+        self.strategy_fee_spin = QDoubleSpinBox()
+        self.strategy_fee_spin.setRange(0.0, 1.0)
+        self.strategy_fee_spin.setDecimals(5)
+        self.strategy_fee_spin.setSingleStep(0.0001)
+        self.strategy_fee_spin.setValue(AI_DEFAULT_TRADE_FEE)
+        self._prepare_spinbox(self.strategy_fee_spin, "手续费比例 0~1")
+        fee_label = QLabel("交易手续费 (Fee):")
+        form_layout.addRow(fee_label, self.strategy_fee_spin)
+        self._register_strategy_form_field(["ma", "dca", "grid"], fee_label, self.strategy_fee_spin)
+
+        self.dca_monthly_amount_spin = QDoubleSpinBox()
+        self.dca_monthly_amount_spin.setRange(0.0, 1_000_000_000.0)
+        self.dca_monthly_amount_spin.setDecimals(2)
+        self.dca_monthly_amount_spin.setSingleStep(100.0)
+        self.dca_monthly_amount_spin.setValue(1_000.0)
+        self._prepare_spinbox(self.dca_monthly_amount_spin, "月度定投金额，可直接输入")
+        dca_label = QLabel("月定投金额 (Monthly Invest):")
+        form_layout.addRow(dca_label, self.dca_monthly_amount_spin)
+        self._register_strategy_form_field("dca", dca_label, self.dca_monthly_amount_spin)
 
         self.grid_interval_percent_spin = QDoubleSpinBox()
-        self.grid_interval_percent_spin.setRange(0.0001, 1.0)
+        self.grid_interval_percent_spin.setRange(0.0001, 5.0)
         self.grid_interval_percent_spin.setDecimals(4)
         self.grid_interval_percent_spin.setSingleStep(0.001)
         self.grid_interval_percent_spin.setValue(0.01)
-        self._prepare_spinbox(self.grid_interval_percent_spin, "网格间距 0.0001~1")
-        form_layout.addRow("网格间距 (%) (Grid Interval %):", self.grid_interval_percent_spin)
+        self._prepare_spinbox(self.grid_interval_percent_spin, "网格间距 0.0001~5")
+        grid_interval_label = QLabel("网格间距 (%) (Grid Interval %):")
+        form_layout.addRow(grid_interval_label, self.grid_interval_percent_spin)
+        self._register_strategy_form_field("grid", grid_interval_label, self.grid_interval_percent_spin)
 
         self.grid_num_lower_spin = QSpinBox()
         self.grid_num_lower_spin.setRange(1, 200)
         self.grid_num_lower_spin.setValue(5)
         self._prepare_spinbox(self.grid_num_lower_spin, "下方网格数 1-200")
-        form_layout.addRow("下方网格数量 (Lower Grids):", self.grid_num_lower_spin)
+        grid_lower_label = QLabel("下方网格数量 (Lower Grids):")
+        form_layout.addRow(grid_lower_label, self.grid_num_lower_spin)
+        self._register_strategy_form_field("grid", grid_lower_label, self.grid_num_lower_spin)
 
         self.grid_num_upper_spin = QSpinBox()
         self.grid_num_upper_spin.setRange(1, 200)
         self.grid_num_upper_spin.setValue(5)
         self._prepare_spinbox(self.grid_num_upper_spin, "上方网格数 1-200")
-        form_layout.addRow("上方网格数量 (Upper Grids):", self.grid_num_upper_spin)
+        grid_upper_label = QLabel("上方网格数量 (Upper Grids):")
+        form_layout.addRow(grid_upper_label, self.grid_num_upper_spin)
+        self._register_strategy_form_field("grid", grid_upper_label, self.grid_num_upper_spin)
 
         self.grid_order_size_spin = QDoubleSpinBox()
         self.grid_order_size_spin.setRange(0.0, 100_000_000.0)
         self.grid_order_size_spin.setDecimals(2)
         self.grid_order_size_spin.setSingleStep(100.0)
-        self.grid_order_size_spin.setValue(1000.0)
+        self.grid_order_size_spin.setValue(1_000.0)
         self._prepare_spinbox(self.grid_order_size_spin, "单笔金额，可自定义")
-        form_layout.addRow("单笔订单金额 (Order Size):", self.grid_order_size_spin)
-        # --- End Grid Trading Strategy Parameters ---
+        grid_order_label = QLabel("单笔订单金额 (Order Size):")
+        form_layout.addRow(grid_order_label, self.grid_order_size_spin)
+        self._register_strategy_form_field("grid", grid_order_label, self.grid_order_size_spin)
 
         layout.addLayout(form_layout)
 
         self.backtest_button = QPushButton("开始回测 (Run Backtest)")
-        self.backtest_button.clicked.connect(self.show_backtest) # 复用旧的函数名，但现在它只负责回测
+        self.backtest_button.clicked.connect(self.show_backtest)
         layout.addWidget(self.backtest_button)
 
         self.export_backtest_button = QPushButton("导出回测报告 (Export Report)")
@@ -1099,14 +1214,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.export_trades_button)
 
         # === AI 动态策略 ===
-        ai_group = QGroupBox("AI 动态策略对比 (Reinforcement Learning)")
-        ai_form = QFormLayout(ai_group)
+        self.ai_group = QGroupBox("AI 动态策略对比 (Reinforcement Learning)")
+        ai_form = QFormLayout(self.ai_group)
 
         self.ai_framework_combo = QComboBox()
         self._populate_framework_combo(self.ai_framework_combo)
         self._select_first_available_framework(self.ai_framework_combo)
 
-        today = QDate.currentDate()
         self.ai_train_start = QDateEdit(calendarPopup=True)
         self.ai_train_end = QDateEdit(calendarPopup=True)
         self.ai_test_start = QDateEdit(calendarPopup=True)
@@ -1129,12 +1243,10 @@ class MainWindow(QMainWindow):
         self.ai_initial_cash_spin.setValue(100000.0)
         self._prepare_spinbox(self.ai_initial_cash_spin, "初始资金，可直接输入")
 
-        # AI 训练设备选择
         self.ai_device_combo = QComboBox()
         self._populate_device_combo(self.ai_device_combo)
         self.ai_device_combo.setToolTip("选择训练使用的设备：自动、CPU或强制使用特定GPU")
-        
-        # AI 训练设备刷新按钮
+
         self.ai_device_refresh_btn = QPushButton("🔄")
         self.ai_device_refresh_btn.setMaximumWidth(40)
         self.ai_device_refresh_btn.setToolTip("刷新GPU列表")
@@ -1144,7 +1256,7 @@ class MainWindow(QMainWindow):
         self.ai_device_diag_btn.setMaximumWidth(40)
         self.ai_device_diag_btn.setToolTip("查看GPU诊断信息")
         self.ai_device_diag_btn.clicked.connect(self._show_gpu_diagnostics)
-        
+
         ai_device_widget = QWidget()
         ai_device_layout = QHBoxLayout(ai_device_widget)
         ai_device_layout.setContentsMargins(0, 0, 0, 0)
@@ -1152,7 +1264,6 @@ class MainWindow(QMainWindow):
         ai_device_layout.addWidget(self.ai_device_refresh_btn)
         ai_device_layout.addWidget(self.ai_device_diag_btn)
 
-        # AI 训练轮次手动设置
         self.ai_epoch_spin = QSpinBox()
         self.ai_epoch_spin.setRange(1, 200_000)
         self.ai_epoch_spin.setSingleStep(10)
@@ -1221,45 +1332,85 @@ class MainWindow(QMainWindow):
         self.ai_progress.setTextVisible(True)
         ai_form.addRow("任务进度:", self.ai_progress)
 
-        layout.addWidget(ai_group)
+        layout.addWidget(self.ai_group)
 
         layout.addStretch()
 
-        # Connect strategy combo to toggle parameter visibility
-        self.strategy_combo.currentIndexChanged.connect(self._toggle_grid_params_visibility)
-        # Initial call to set correct visibility
-        self._toggle_grid_params_visibility()
+        self.strategy_combo.currentIndexChanged.connect(self._on_strategy_changed)
+        self._on_strategy_changed()
 
-    def _toggle_grid_params_visibility(self) -> None:
-        selected_strategy = self.strategy_combo.currentText()
-        is_grid_strategy = "网格策略" in selected_strategy
+    def _register_strategy_form_field(
+        self,
+        strategies: Iterable[str] | str,
+        label_widget: QWidget,
+        field_widget: QWidget,
+    ) -> None:
+        if label_widget is None or field_widget is None:
+            return
 
-        self.grid_initial_cash_spin.setVisible(is_grid_strategy)
-        self.grid_fee_spin.setVisible(is_grid_strategy)
-        self.grid_interval_percent_spin.setVisible(is_grid_strategy)
-        self.grid_num_lower_spin.setVisible(is_grid_strategy)
-        self.grid_num_upper_spin.setVisible(is_grid_strategy)
-        self.grid_order_size_spin.setVisible(is_grid_strategy)
+        if isinstance(strategies, str):
+            strategy_keys = {strategies}
+        else:
+            strategy_keys = {str(key) for key in strategies if key}
 
-        # Also toggle labels for these controls
-        # This assumes the labels are directly associated with the widgets in the form layout
-        # A more robust way would be to store references to the labels themselves.
-        form_layout = self.strategy_combo.parentWidget().layout() # Get the form layout
-        if isinstance(form_layout, QFormLayout):
-            for i in range(form_layout.rowCount()):
-                label_item = form_layout.itemAt(i, QFormLayout.LabelRole)
-                field_item = form_layout.itemAt(i, QFormLayout.FieldRole)
-                
-                if field_item and field_item.widget() in [
-                    self.grid_initial_cash_spin,
-                    self.grid_fee_spin,
-                    self.grid_interval_percent_spin,
-                    self.grid_num_lower_spin,
-                    self.grid_num_upper_spin,
-                    self.grid_order_size_spin,
-                ]:
-                    if label_item and label_item.widget():
-                        label_item.widget().setVisible(is_grid_strategy)
+        if not strategy_keys:
+            return
+
+        key = (label_widget, field_widget)
+        existing = self._strategy_field_map.get(key)
+        if existing is None:
+            existing = set()
+            self._strategy_field_map[key] = existing
+        existing.update(strategy_keys)
+
+    def _set_strategy_row_visibility(self, active_key: str) -> None:
+        if not self._strategy_field_map:
+            return
+
+        for (label, field), keys in self._strategy_field_map.items():
+            visible = "all" in keys or active_key in keys
+            if label is not None:
+                label.setVisible(visible)
+            if field is not None:
+                field.setVisible(visible)
+
+    def _on_strategy_changed(self) -> None:
+        if self.strategy_combo is None:
+            return
+
+        current_data = self.strategy_combo.currentData()
+        strategy_key = str(current_data) if current_data else "ma"
+        self._set_strategy_row_visibility(strategy_key)
+
+        is_ai = strategy_key == "ai"
+        if self.ai_group is not None:
+            self.ai_group.setVisible(is_ai)
+
+        if self.backtest_button is not None:
+            self.backtest_button.setText("启动 AI 策略对比" if is_ai else "开始回测 (Run Backtest)")
+
+        if self.export_trades_button is not None:
+            self.export_trades_button.setVisible(is_ai)
+            if not is_ai:
+                self.export_trades_button.setEnabled(False)
+
+        if self.export_backtest_button is not None:
+            if is_ai:
+                self.export_backtest_button.setEnabled(self.ai_comparison_result is not None)
+            else:
+                self.export_backtest_button.setEnabled(self._last_backtest_result is not None)
+
+    def _slice_dataframe_for_backtest(self, start_date: QDate, end_date: QDate) -> pd.DataFrame:
+        if self.full_df is None or self.full_df.empty:
+            return pd.DataFrame()
+
+        start_ts = pd.Timestamp(start_date.toPyDate())
+        end_ts = pd.Timestamp(end_date.toPyDate())
+        if start_ts > end_ts:
+            start_ts, end_ts = end_ts, start_ts
+
+        mask = (self.full_df["Date"] >= start_ts) & (self.full_df["Date"] <= end_ts)
+        return self.full_df.loc[mask].copy()
 
     def _detect_framework_status(self) -> Dict[str, Dict[str, str]]:
         status: Dict[str, Dict[str, str]] = {}
@@ -1429,14 +1580,20 @@ class MainWindow(QMainWindow):
             self.run_button,
             # Backtest Tab
             self.strategy_combo,
-            self.grid_initial_cash_spin,
-            self.grid_fee_spin,
+            self.train_start_edit,
+            self.train_end_edit,
+            self.test_start_edit,
+            self.test_end_edit,
+            self.strategy_initial_cash_spin,
+            self.strategy_fee_spin,
+            self.dca_monthly_amount_spin,
             self.grid_interval_percent_spin,
             self.grid_num_lower_spin,
             self.grid_num_upper_spin,
             self.grid_order_size_spin,
             self.backtest_button,
             self.export_backtest_button,
+            self.export_trades_button,
             # AI Strategy Controls
             self.ai_framework_combo,
             self.ai_train_start,
@@ -2122,24 +2279,67 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "缺少数据", "请先在图表分析页加载数据。")
             return
 
-        selected_strategy = self.strategy_combo.currentText()
+        strategy_key = "ma"
+        if self.strategy_combo is not None:
+            data = self.strategy_combo.currentData()
+            if isinstance(data, str) and data:
+                strategy_key = data
+
+        if strategy_key == "ai":
+            self.append_log("当前选择为 AI 动态策略，将启动专用回测流程。")
+            self._on_strategy_changed()
+            self._start_ai_backtest()
+            return
+
+        selected_strategy = self.strategy_combo.currentText() if self.strategy_combo else "自定义策略"
         self.append_log(f"开始执行回测: {selected_strategy}")
         self.status_label.setText(f"正在回测: {selected_strategy}...")
+
+        if self.test_start_edit is None or self.test_end_edit is None:
+            QMessageBox.warning(self, "缺少日期", "请确保已配置测试区间。")
+            return
+
+        df_slice = self._slice_dataframe_for_backtest(self.test_start_edit.date(), self.test_end_edit.date())
+        if df_slice.empty:
+            QMessageBox.warning(self, "样本不足", "所选测试区间内没有有效数据，请调整日期范围。")
+            self.append_log("测试区间内无数据，已取消回测。")
+            return
+
+        start_str = self.test_start_edit.date().toString("yyyy-MM-dd")
+        end_str = self.test_end_edit.date().toString("yyyy-MM-dd")
+        self.append_log(f"测试区间: {start_str} ~ {end_str}，共 {len(df_slice)} 行数据。")
+
+        initial_cash = float(self.strategy_initial_cash_spin.value()) if self.strategy_initial_cash_spin else 100_000.0
+        fee = float(self.strategy_fee_spin.value()) if self.strategy_fee_spin else AI_DEFAULT_TRADE_FEE
+
         self._set_controls_enabled(False)
+        self.ai_comparison_result = None
 
         try:
-            if "网格策略" in selected_strategy:
+            if strategy_key == "grid":
                 result = run_grid_backtest(
-                    self.full_df,
-                    initial_cash=self.grid_initial_cash_spin.value(),
-                    fee=self.grid_fee_spin.value(),
-                    grid_interval_percent=self.grid_interval_percent_spin.value(),
-                    num_lower_grids=self.grid_num_lower_spin.value(),
-                    num_upper_grids=self.grid_num_upper_spin.value(),
-                    order_size=self.grid_order_size_spin.value(),
+                    df_slice,
+                    initial_cash=initial_cash,
+                    fee=fee,
+                    grid_interval_percent=self.grid_interval_percent_spin.value() if self.grid_interval_percent_spin else 0.01,
+                    num_lower_grids=self.grid_num_lower_spin.value() if self.grid_num_lower_spin else 5,
+                    num_upper_grids=self.grid_num_upper_spin.value() if self.grid_num_upper_spin else 5,
+                    order_size=self.grid_order_size_spin.value() if self.grid_order_size_spin else 1000.0,
                 )
-            else: # 默认均线策略
-                result = run_backtest(self.full_df)
+            elif strategy_key == "dca":
+                monthly_invest = float(self.dca_monthly_amount_spin.value()) if self.dca_monthly_amount_spin else 1000.0
+                result = run_dca_backtest(
+                    df_test=df_slice,
+                    initial_cash=initial_cash,
+                    monthly_investment=monthly_invest,
+                    fee=fee,
+                )
+            else:  # 默认均线策略
+                result = run_backtest(
+                    df_slice,
+                    initial_cash=initial_cash,
+                    fee=fee,
+                )
 
             self._last_backtest_result = result
             self.export_backtest_button.setEnabled(True)

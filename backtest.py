@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover - 延迟到调用处提示
 
 from ai_strategy import DynamicGridEnv
 
-def run_backtest(df: pd.DataFrame, initial_cash=100_000):
+def run_backtest(df: pd.DataFrame, initial_cash: float = 100_000.0, fee: float = 0.001):
     """
     运行基于“智行”规则的移动平均线交叉策略回测。
     这是 v2.0 方案中的基准策略之一。
@@ -54,7 +54,9 @@ def run_backtest(df: pd.DataFrame, initial_cash=100_000):
     }, inplace=True)
     bt_df = bt_df.set_index('Date')
 
-    bt = Backtest(bt_df, ZhixingMaStrategy, cash=initial_cash, commission=.001)
+    commission = max(0.0, min(float(fee), 1.0))
+
+    bt = Backtest(bt_df, ZhixingMaStrategy, cash=initial_cash, commission=commission)
     stats = bt.run()
 
     equity_curve = stats['_equity_curve']['Equity']
@@ -418,7 +420,7 @@ def run_ai_comparison_backtest(
         if isinstance(df_prepared.index, pd.DatetimeIndex)
         else df_prepared.copy()
     )
-    zhixing_result = run_backtest(baseline_input, initial_cash=initial_cash)
+    zhixing_result = run_backtest(baseline_input, initial_cash=initial_cash, fee=fee)
 
     dca_result = run_dca_backtest(
         df_test=df_prepared,
